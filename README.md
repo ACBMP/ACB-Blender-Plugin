@@ -56,7 +56,12 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
    - Collision meshes: **Show Collision** (they're hidden while visuals are shown), then use edit mode and assign
      faces to the collision material slots. Shapes are shared between objects as in the game; **Make Shape
      Unique** splits one off. **Mesh to Collision** turns any plain mesh into new static collision that is also
-     visible in game, with climb edges.
+     visible in game, with climb edges. Big meshes are split into pieces (at most *Max piece size*, 20000
+     triangles and a 15-tile uv span each).
+   - **New map from an existing one:** **Clear Scenery** removes every visible mesh and static collision element
+     (and the far-distance stand-ins of the old buildings), keeping spawns, chests, interactive objects, zones and
+     out-of-bounds. Then import your geometry (File → Import → Wavefront OBJ / FBX), select it and use Mesh to
+     Collision, and move the spawns onto it. The map still installs over the map it came from.
    - Visible geometry: **Mesh to Scenery** turns a plain mesh into a visible object without collision; **Replace
      Visual** (select a plain mesh, then the element) swaps an element's visible mesh. Material slots holding one of
      the map's materials (`ACBMat_*`, in the material list once a map is open) keep it; other slots get the map's
@@ -100,6 +105,15 @@ acbmap install <forge> | uninstall <name> | status
   skins table's id. The skins forges are never edited. Chest data is regenerated from the map's chest spawns,
   with phantom twins exactly as retail has them.
 - Edited collision drops the stored MOPP (`MoppCodeVersionNumber=0`), so ACB compiles its own at load.
+- Most retail static collision is merged into compounds (an entity with a `MultiInertComponent`, whose
+  `MultiMeshShape` lists member entities and holds one MOPP over all of them; members have `IsMerged=1`). ACB
+  uses that MOPP as stored and never gives a merged member its own rigid body. So moving, reshaping or deleting a
+  member dissolves its compound (the compound entity goes, its members get `IsMerged=0` and collide on their own),
+  and copies are always unmerged. The checks flag a merged entity outside any compound (it would have no
+  collision).
+- New collision and scenery go into the whole-map grid cell, which is always loaded (level-0 cells stream in only
+  within a radius of the World's anchor). Map materials and texture sets they borrow from a cell entry that isn't
+  always loaded are copied into the new entry (they live inside cell entries and load only with them).
 
 ## Known limits (milestone 1)
 
@@ -109,7 +123,7 @@ acbmap install <forge> | uninstall <name> | status
   normal maps (visible in Material Preview / Rendered shading); specular maps are ignored, and materials without a
   diffuse texture (blend spots, decals, FX planes) show plain white.
 - **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle refs. NPCs ignore
-  new collision.
+  new collision, and on a cleared map they keep walking the old map's navmesh.
 - **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. The
   generator makes ledges and swing poles (the only other type the MP maps use; poles match retail's: 186 of 190
   found, 178 of 184 generated are retail poles). Ledges follow physical rules, but retail's were placed by hand:

@@ -141,6 +141,9 @@ def test_clear_scenery(tmp_path):
     spawns = count(d, "spawn")
     r = ops.clear_scenery(d)
     d2 = reopen(d, tmp_path)
-    assert r["removed"] > 100 and count(d2, "collision") == 0 and count(d2, "spawn") == spawns
+    # collision that is part of a gameplay object (a chase breaker's frame, a hay cart) or that something links to
+    # stays; no standalone scenery collision does
+    roots = [e for e in classify(d2, with_children=False) if e.kind == "collision"]
+    assert r["removed"] > 100 and len(roots) <= r["kept_referenced"] and count(d2, "spawn") == spawns
     from acbmap.checks import new_problems
     assert new_problems(d2, MapDocument(MAP)) == []
