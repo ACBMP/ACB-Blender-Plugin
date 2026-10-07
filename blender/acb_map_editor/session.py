@@ -89,6 +89,60 @@ def show_textures():
                         sp.shading.color_type = "TEXTURE"
 
 
+def normal_decode_group():
+    """Node group turning an ACB normal map sample into a Blender (OpenGL) tangent-space colour: picks x from red or
+    alpha, inverts green (the maps are DirectX style) and rebuilds z for two-channel maps."""
+    g = bpy.data.node_groups.get("ACB Normal Decode")
+    if g is not None:
+        return g
+    g = bpy.data.node_groups.new("ACB Normal Decode", "ShaderNodeTree")
+    g.interface.new_socket("Color", in_out="INPUT", socket_type="NodeSocketColor")
+    g.interface.new_socket("Alpha", in_out="INPUT", socket_type="NodeSocketFloat")
+    s = g.interface.new_socket("Alpha in X", in_out="INPUT", socket_type="NodeSocketFloat")
+    s.min_value, s.max_value = 0.0, 1.0
+    g.interface.new_socket("Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+    n, ln = g.nodes, g.links
+    gin, gout = n.new("NodeGroupInput"), n.new("NodeGroupOutput")
+    sep = n.new("ShaderNodeSeparateColor")
+    ln.new(gin.outputs["Color"], sep.inputs["Color"])
+
+    def math(op, a, b=None):
+        """A Math node; operands are sockets or constants."""
+        m = n.new("ShaderNodeMath")
+        m.operation = op
+        for i, x in enumerate((a, b)):
+            if isinstance(x, (int, float)):
+                m.inputs[i].default_value = x
+            elif x is not None:
+                ln.new(x, m.inputs[i])
+        return m.outputs[0]
+
+    def to_color(c):   # [-1, 1] -> [0, 1]
+        return math("ADD", math("MULTIPLY", c, 0.5), 0.5)
+    mix = n.new("ShaderNodeMix")              # x channel: red (rgb maps) or alpha (two-channel maps)
+    mix.data_type = "FLOAT"
+    ln.new(gin.outputs["Alpha in X"], mix.inputs["Factor"])
+    ln.new(sep.outputs["Red"], mix.inputs["A"])
+    ln.new(gin.outputs["Alpha"], mix.inputs["B"])
+    xs = mix.outputs["Result"]
+    x = math("SUBTRACT", math("MULTIPLY", xs, 2.0), 1.0)
+    y = math("SUBTRACT", 1.0, math("MULTIPLY", sep.outputs["Green"], 2.0))         # DirectX -> OpenGL: -y
+    zd = math("SQRT", math("MAXIMUM", math("SUBTRACT", math("SUBTRACT", 1.0, math("MULTIPLY", x, x)),
+                                             math("MULTIPLY", y, y)), 0.0))
+    zs = math("SUBTRACT", math("MULTIPLY", sep.outputs["Blue"], 2.0), 1.0)
+    zmix = n.new("ShaderNodeMix")
+    zmix.data_type = "FLOAT"
+    ln.new(gin.outputs["Alpha in X"], zmix.inputs["Factor"])
+    ln.new(zs, zmix.inputs["A"])
+    ln.new(zd, zmix.inputs["B"])
+    comb = n.new("ShaderNodeCombineColor")
+    ln.new(to_color(x), comb.inputs["Red"])
+    ln.new(to_color(y), comb.inputs["Green"])
+    ln.new(to_color(zmix.outputs["Result"]), comb.inputs["Blue"])
+    ln.new(comb.outputs["Color"], gout.inputs["Color"])
+    return g
+
+
 def get(scene) -> "Session | None":
     return SESSIONS.get(scene.name)
 
@@ -363,10 +417,26 @@ class Session:
                     mat.surface_render_method = "DITHERED"
                 else:
                     mat.blend_method = "CLIP"
+        nid = V.material_texture(self.doc, mid, 1)
+        nimg = self._texture_image(nid, non_color=True)
+        if nimg is not None and bsdf is not None:
+            tex = nt.nodes.new("ShaderNodeTexImage")
+            tex.image = nimg
+            tex.location = (-620, -200)
+            dec = nt.nodes.new("ShaderNodeGroup")
+            dec.node_tree = normal_decode_group()
+            dec.location = (-320, -200)
+            dec.inputs["Alpha in X"].default_value = 1.0 if V.normal_map_layout(self.doc, nid) == "ag" else 0.0
+            nm = nt.nodes.new("ShaderNodeNormalMap")
+            nm.location = (-140, -200)
+            nt.links.new(tex.outputs["Color"], dec.inputs["Color"])
+            nt.links.new(tex.outputs["Alpha"], dec.inputs["Alpha"])
+            nt.links.new(dec.outputs["Color"], nm.inputs["Color"])
+            nt.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
         mat.use_backface_culling = not flags.get("two_sided", False)
         return mat
 
-    def _texture_image(self, tid: int | None):
+    def _texture_image(self, tid: int | None, non_color: bool = False):
         if tid is None:
             return None
         nm = f"ACBTex_{self.doc.name_of(tid)}"
@@ -388,6 +458,9 @@ class Session:
         except RuntimeError:
             return None
         img.name = nm
+        if non_color:
+            img.colorspace_settings.name = "Non-Color"
+            img.alpha_mode = "CHANNEL_PACKED"   # alpha carries data (x) in two-channel normal maps
         return img
 
     def _col_material(self, mid: int):

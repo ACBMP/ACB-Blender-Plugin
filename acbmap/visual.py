@@ -14,6 +14,11 @@ skinned (crowd, characters) and isn't decoded.
 
 Textures: CompiledTextureMap.Data is a plain mip chain (largest first), PixelFormat 0 = 32-bit uncompressed,
 2/3 = DXT1, 4 = DXT3, 5 = DXT5. TextureSet.Maps slot 0 is the diffuse map, 1 the normal map, 2 the specular map.
+
+Normal maps are tangent space, DirectX convention: the vertex tangent (ubyte4 after the normal) follows +u, and the
+bitangent, cross(normal, tangent) times -sign(position w), follows +v as stored (down the texture), so green points
+down the image (inverted for Blender). DXT1 normal maps hold x, y, z in RGB; DXT5 and uncompressed ones hold x in
+alpha and y in green (DXT5 copies y to blue, red is 255), with z = sqrt(1 - x^2 - y^2).
 """
 from __future__ import annotations
 
@@ -133,6 +138,12 @@ def material_texture(doc: MapDocument, material_uid: int, slot: int = 0) -> int 
         return None
     t = u32(maps[slot].id)
     return t if t in doc.info and doc.type_of(t) == "TextureMap" else None
+
+
+def normal_map_layout(doc: MapDocument, tex_uid: int) -> str:
+    """'rgb' (x, y, z in RGB) or 'ag' (x in alpha, y in green, z derived): see the module docstring."""
+    c = doc.obj(tex_uid).fields["CompiledTextureMap"].obj
+    return "rgb" if u32(c.fields["PixelFormat"]) in (2, 3) else "ag"
 
 
 def material_flags(doc: MapDocument, material_uid: int) -> dict:

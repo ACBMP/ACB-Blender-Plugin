@@ -100,8 +100,9 @@ acbmap install <forge> | uninstall <name> | status
 
 - **Visual meshes are display-only.** Moving, copying or deleting an entity carries its visual along, but the meshes
   themselves can't be edited, and new collision (Mesh to Collision) has no visible geometry in game. Skinned meshes
-  (elevators, crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Only the diffuse texture is
-  used, and materials without one (blend spots, decals, FX planes) show plain white.
+  (elevators, crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Materials use the diffuse and
+  normal maps (visible in Material Preview / Rendered shading); specular maps are ignored, and materials without a
+  diffuse texture (blend spots, decals, FX planes) show plain white.
 - **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle refs. NPCs ignore
   new collision.
 - **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. Generated
