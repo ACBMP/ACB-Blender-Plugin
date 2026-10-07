@@ -1,0 +1,16 @@
+[project]
+name = "acbmap"
+version = "0.1.0"
+description = "Assassin's Creed Brotherhood MP map editor core (Blender add-on backend)"
+requires-python = ">=3.11"
+dependencies = ["anvilforge"]   # vendor/anvilforge-py (submodule): pip install -e vendor/anvilforge-py
+
+[project.scripts]
+acbmap = "acbmap.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["acbmap"]

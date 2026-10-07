@@ -1,0 +1,3 @@
+[submodule "vendor/anvilforge-py"]
+	path = vendor/anvilforge-py
+	url = ../anvilforge-py.git
