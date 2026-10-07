@@ -12,6 +12,7 @@ from . import ensure_paths, prefs
 ensure_paths(prefs())
 
 from acbmap import fields, ops  # noqa: E402
+from acbmap import guidance as G  # noqa: E402
 from acbmap.doc import MapDocument, u32  # noqa: E402
 from acbmap.geom import from_blender  # noqa: E402
 from acbmap.kinds import Element, classify, components, kind_of  # noqa: E402
@@ -256,9 +257,11 @@ class ACB_OT_add_element(bpy.types.Operator):
 
 
 class ACB_OT_new_collision(bpy.types.Operator):
-    """Turn the selected plain mesh objects into ACB static collision (no visual mesh, no climb edges yet)"""
+    """Turn the selected plain mesh objects into ACB static collision (no visual mesh), with generated climb edges"""
     bl_idname = "acb.new_collision"
     bl_label = "Mesh to Collision"
+    bl_options = {"REGISTER", "UNDO"}
+    climb: bpy.props.BoolProperty(name="Climb edges", default=True, description="Generate ledges from the mesh")
 
     def execute(self, context):
         import bmesh
@@ -284,6 +287,11 @@ class ACB_OT_new_collision(bpy.types.Operator):
             except ops.EditError as ex:
                 self.report({"ERROR"}, str(ex))
                 return {"CANCELLED"}
+            if self.climb:
+                try:
+                    G.regenerate(s.doc, nk, ops.fresh_ids)
+                except ValueError as ex:
+                    self.report({"WARNING"}, f"no climb edges: {ex}")
             o = ops.element_obj(s.doc, nk)
             e = Element("collision", nk[0], o, -1, [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
             new = s._element_object(e)
@@ -319,6 +327,53 @@ class ACB_OT_make_unique(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class ACB_OT_generate_climb(bpy.types.Operator):
+    """Generate climb edges (ledges) for the selected elements from their own collision, replacing any they had.
+    Retail edges also come from neighbouring geometry, so regenerating a retail object can lose some"""
+    bl_idname = "acb.generate_climb"
+    bl_label = "Generate Climb Edges"
+    bl_options = {"REGISTER", "UNDO"}
+    min_depth: bpy.props.FloatProperty(name="Min ledge depth", default=G.MIN_DEPTH, min=0.0, unit="LENGTH",
+                                       description="Walkable surface needed behind a ledge")
+    min_drop: bpy.props.FloatProperty(name="Min wall drop", default=G.MIN_DROP, min=0.0, unit="LENGTH",
+                                      description="Wall height needed below a ledge (lower edges are steps)")
+
+    def execute(self, context):
+        s = sess(context)
+        s.sync()
+        done, total = 0, 0
+        seen = set()
+        for ob in context.selected_objects:
+            if "acb_key" not in ob or ob["acb_key"] in seen:
+                continue
+            seen.add(ob["acb_key"])
+            key = S.parse_key(ob["acb_key"])
+            el = s.objects.get(ob["acb_key"])
+            eob = bpy.data.objects.get(el) if el else ob
+            try:
+                n = G.regenerate(s.doc, key, ops.fresh_ids, self.min_depth, self.min_drop)
+            except (ops.EditError, ValueError) as ex:
+                self.report({"ERROR"}, f"{ob.name}: {ex}")
+                continue
+            s.climb_object(ops.element_obj(s.doc, key), eob, ob["acb_key"])
+            done += 1
+            total += n
+        s.set_collection_visible("Climb Edges", True)
+        self.report({"INFO"}, f"{total} climb edges on {done} element(s)")
+        return {"FINISHED"}
+
+
+class ACB_OT_toggle_climb(bpy.types.Operator):
+    """Show or hide the climb edges (ledges the player can grab)"""
+    bl_idname = "acb.toggle_climb"
+    bl_label = "Show Climb Edges"
+
+    def execute(self, context):
+        s = sess(context)
+        s.set_collection_visible("Climb Edges", not s.collection_visible("Climb Edges"))
+        return {"FINISHED"}
+
+
 class ACB_OT_strip_guidance(bpy.types.Operator):
     """Remove the active element's climb edges (GuidanceSystem); do this after reshaping collision that had them"""
     bl_idname = "acb.strip_guidance"
@@ -329,8 +384,12 @@ class ACB_OT_strip_guidance(bpy.types.Operator):
         ob, key = active_element(context)
         if ob is None:
             return {"CANCELLED"}
-        if ops.strip_guidance(ops.element_obj(s.doc, key)):
+        o = ops.element_obj(s.doc, key)
+        if ops.strip_guidance(o):
             s.doc.touch(key[0])
+            eob = bpy.data.objects.get(s.objects.get(ob["acb_key"], ""))
+            if eob is not None:
+                s.climb_object(o, eob, ob["acb_key"])
             self.report({"INFO"}, "climb edges removed")
         else:
             self.report({"INFO"}, "no climb edges on this element")
@@ -556,7 +615,7 @@ class ACB_PT_map(ACBPanel, bpy.types.Panel):
 
 
 class ACB_PT_tools(ACBPanel, bpy.types.Panel):
-    bl_label = "Add / Collision"
+    bl_label = "Add / Collision / Climbing"
     bl_parent_id = "ACB_PT_map"
 
     @classmethod
@@ -573,6 +632,11 @@ class ACB_PT_tools(ACBPanel, bpy.types.Panel):
                      icon="HIDE_OFF" if vis else "HIDE_ON")
         col.operator("acb.new_collision", icon="MESH_CUBE")
         col.operator("acb.make_unique", icon="DUPLICATE")
+        col.separator()
+        cv = s.collection_visible("Climb Edges") if s is not None else False
+        col.operator("acb.toggle_climb", text="Hide Climb Edges" if cv else "Show Climb Edges",
+                     icon="HIDE_OFF" if cv else "HIDE_ON")
+        col.operator("acb.generate_climb", icon="MOD_EDGESPLIT")
         col.operator("acb.strip_guidance", icon="X")
 
 
@@ -659,7 +723,8 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
 
 
 CLASSES = (ACB_OT_open_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
-           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_make_unique, ACB_OT_strip_guidance,
+           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
+           ACB_OT_strip_guidance,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_add_selected, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,
            ACB_PT_map, ACB_PT_tools, ACB_PT_escort, ACB_PT_inspector)

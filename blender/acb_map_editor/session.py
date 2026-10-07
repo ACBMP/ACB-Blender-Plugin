@@ -24,6 +24,7 @@ import struct
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
+from acbmap import guidance as G
 from acbmap import ops
 from acbmap import visual as V
 from acbmap.doc import MapDocument, u32
@@ -154,11 +155,18 @@ class Session:
         if with_visuals:
             self.set_collision_visible(False)
             show_textures()
+        self.set_collection_visible("Climb Edges", False)
         self.snapshot()
 
     def set_collision_visible(self, visible: bool):
         """Show or hide the Collision collection (hidden by default while visual meshes are shown)."""
-        name = f"Collision [{self.tag}]"
+        self.set_collection_visible("Collision", visible)
+
+    def collision_visible(self) -> bool:
+        return self.collection_visible("Collision")
+
+    def set_collection_visible(self, coll: str, visible: bool):
+        name = f"{coll} [{self.tag}]"
 
         def find(lc):
             if lc.collection.name == name:
@@ -173,12 +181,12 @@ class Session:
             if lc is not None:
                 lc.hide_viewport = not visible
 
-    def collision_visible(self) -> bool:
+    def collection_visible(self, coll: str) -> bool:
         lc = bpy.context.view_layer.layer_collection
         stack = [lc]
         while stack:
             c = stack.pop()
-            if c.collection.name == f"Collision [{self.tag}]":
+            if c.collection.name == f"{coll} [{self.tag}]":
                 return not c.hide_viewport
             stack += list(c.children)
         return True
@@ -253,6 +261,7 @@ class Session:
             ch.display_type = "WIRE"
             ch["acb_visual_of"] = k
         self._zones(e, ob, k)
+        self.climb_object(e.obj, ob, k)
         if e.kind == "out_of_bounds":
             self._oob_sections(e, ob, k)
         return ob
@@ -278,6 +287,28 @@ class Session:
         me["acb_shape"] = f"{sid:08x}"
         self.mesh_base[me.name] = mesh_hash(me)
         return me
+
+    def climb_object(self, entity, ob, k):
+        """(Re)build the line object showing an element's climb edges (entity-local, so parented with no offset)."""
+        old = bpy.data.objects.get(f"{ob.name}:climb")
+        if old is not None and old.get("acb_climb_of") == k:
+            me = old.data
+            bpy.data.objects.remove(old)
+            if me.users == 0:
+                bpy.data.meshes.remove(me)
+        edges = [e for g in G.systems(entity) for e in G.edges(g)]
+        if not edges:
+            return None
+        me = bpy.data.meshes.new(f"ACBClimb_{k}")
+        me.from_pydata([p for e in edges for p in (e.p0, e.p1)], [(2 * i, 2 * i + 1) for i in range(len(edges))], [])
+        ch = bpy.data.objects.new(f"{ob.name}:climb", me)
+        self.coll("Climb Edges").objects.link(ch)
+        ch.parent = ob
+        ch.hide_select = True
+        ch.show_in_front = True
+        ch.color = (1.0, 0.75, 0.1, 1.0)
+        ch["acb_climb_of"] = k
+        return ch
 
     def _visual_mesh(self, uid: int):
         """The Blender mesh of a visual Mesh (LOD0), built once and shared by every entity showing it."""
@@ -608,12 +639,31 @@ class Session:
                 continue
             self._write_shape(me)
             log.append(f"collision shape {me.name} ({len(me.vertices)} verts)")
+            stale = self._climb_users(int(me["acb_shape"], 16))
+            if stale:
+                log.append(f"climb edges now stale on {', '.join(stale[:3])}{' ...' if len(stale) > 3 else ''}: "
+                           "Generate or Remove Climb Edges")
         if chests_changed:
             n = self.wd.sync_chests()
             log.append(f"chest capture world data regenerated ({n} chests)")
         self.snapshot()
         self.log += log
         return log
+
+    def _climb_users(self, sid: int) -> list[str]:
+        """Blender names of elements that have climb edges and use MeshShape sid."""
+        out = []
+        for k, name in self.objects.items():
+            if "|" in k:
+                continue
+            try:
+                o = ops.element_obj(self.doc, parse_key(k))
+            except Exception:
+                continue
+            if G.systems(o) and any(u32(ic.fields["RigidBody"].fields["Shape"].id) == sid
+                                    for _i, ic in ops.inert_components(o)):
+                out.append(name)
+        return out
 
     def _kind_of_key(self, k):
         try:

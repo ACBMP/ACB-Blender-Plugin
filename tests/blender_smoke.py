@@ -1,8 +1,8 @@
 """blender --background --factory-startup --python tests/blender_smoke.py -- <forge>
 
 Drives the add-on the way a user would: open a map, move a spawn, Shift+D a spawn and a chest, delete a spawn,
-reshape a collision mesh and a trigger zone, move and Shift+D a piece of scenery (shown by its visual mesh), save;
-then reopens the saved forge headless and checks every edit."""
+reshape a collision mesh and a trigger zone, move and Shift+D a piece of scenery (shown by its visual mesh), generate
+climb edges on an element, save; then reopens the saved forge headless and checks every edit."""
 import os
 import sys
 import time
@@ -65,6 +65,17 @@ scen_dup.location.y += 7.0
 bpy.context.view_layer.update()
 scen_key, scen_x = scen["acb_key"], scen.matrix_world.translation.x
 log = s.sync()
+climb_el = next(o for o in vis if o["acb_kind"] == "collision" and S.parse_key(o["acb_key"])[1] < 0
+                and o.name != scen_dup.name and o["acb_key"] != scen_dup["acb_key"]
+                and any(c.get("acb_part", "").startswith("shape:") for c in o.children))
+for o in bpy.context.selected_objects:
+    o.select_set(False)
+climb_el.select_set(True)
+bpy.context.view_layer.objects.active = climb_el
+res = bpy.ops.acb.generate_climb()
+climb_key = climb_el["acb_key"]
+climb_drawn = bpy.data.objects.get(f"{climb_el.name}:climb")
+print("SMOKE generate_climb", res, "drawn", climb_drawn is not None)
 print("SMOKE log", log)
 out = os.path.join(os.path.dirname(s.doc.cache), "edited", "smoke_" + os.path.basename(forge))
 probs = s.save(out)
@@ -92,5 +103,11 @@ check(abs(mesh_shape_geometry(d.obj(shape))[0][0][2] - col.data.vertices[0].co.z
 from acbmap.worlddata import WorldData
 w = WorldData(d, os.path.dirname(forge))
 check(len(w.get(2).obj.fields["chestSpawnPoints"]) == len([e for e in els if e.kind == "chest_spawn"]), "chest data")
+from acbmap import guidance as G
+from acbmap import ops as O
+ce = G.systems(O.element_obj(d, S.parse_key(climb_key)))
+n_climb = sum(len(G.edges(g)) for g in ce)
+check(res == {"FINISHED"} and (n_climb == 0 or (climb_drawn is not None and len(climb_drawn.data.edges) == n_climb)),
+      f"generated climb edges saved and drawn ({n_climb})")
 check(not probs, "no new structural problems")
 print("SMOKE RESULT", "PASS" if ok else "FAIL")
