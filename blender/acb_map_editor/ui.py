@@ -289,7 +289,7 @@ class ACB_OT_new_collision(bpy.types.Operator):
                 return {"CANCELLED"}
             if self.climb:
                 try:
-                    G.regenerate(s.doc, nk, ops.fresh_ids)
+                    G.regenerate(s.doc, nk, ops.fresh_ids, world=s.world_collision())
                 except ValueError as ex:
                     self.report({"WARNING"}, f"no climb edges: {ex}")
             o = ops.element_obj(s.doc, nk)
@@ -337,10 +337,14 @@ class ACB_OT_generate_climb(bpy.types.Operator):
                                        description="Walkable surface needed behind a ledge")
     min_drop: bpy.props.FloatProperty(name="Min wall drop", default=G.MIN_DROP, min=0.0, unit="LENGTH",
                                       description="Wall height needed below a ledge (lower edges are steps)")
+    use_world: bpy.props.BoolProperty(name="Use surrounding geometry", default=True,
+                                      description="Drop ledges whose hanging space is taken by another object or "
+                                                  "that sit less than the min drop above any floor")
 
     def execute(self, context):
         s = sess(context)
         s.sync()
+        world = s.world_collision() if self.use_world else None
         done, total = 0, 0
         seen = set()
         for ob in context.selected_objects:
@@ -351,7 +355,7 @@ class ACB_OT_generate_climb(bpy.types.Operator):
             el = s.objects.get(ob["acb_key"])
             eob = bpy.data.objects.get(el) if el else ob
             try:
-                n = G.regenerate(s.doc, key, ops.fresh_ids, self.min_depth, self.min_drop)
+                n = G.regenerate(s.doc, key, ops.fresh_ids, self.min_depth, self.min_drop, world)
             except (ops.EditError, ValueError) as ex:
                 self.report({"ERROR"}, f"{ob.name}: {ex}")
                 continue

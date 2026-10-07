@@ -2,9 +2,12 @@
 
 Layout (inferred from the retail maps; every field below round-trips through fastload):
 - GuidanceObjects: one per edge. Index0/Index1 index the points; SubType is GuidanceObjectSubType (1 ledge grab,
-  2 beam, 3 ladder, 4 pole, 5 rope, 13 haystack, ...); DecN4Normal0/1 are four int16 each, xyz scaled by 511 and
-  a zero w: the two faces meeting at the edge. One is the walkable top, the other the wall or underside; retail
-  stores both orders (56% top first), so the game tells them apart itself.
+  2 beam, 3 ladder, 4 pole, 5 rope, 13 haystack, ...; the MP maps use only 1, 4, 7, 13 and, in the ACFE ports, 14);
+  DecN4Normal0/1 are four int16 each, xyz scaled by 511 and a zero w. One is the walkable top's normal, the other
+  in most retail edges (about 80% of those that can be told apart) the horizontal direction pointing inward, across
+  the top, not the wall's outward normal. Retail stores both orders (56% top first), so the game tells them apart
+  itself. Poles are thin bars (retail: 2 m x 10 cm x 30 cm) with one pole edge along each top long edge, each
+  pointing inward across the bar.
 - CompressPoints: int16 x,y,z per point, signed-normalized into the Partitioner's Min/Max box:
   p = min + (q / 32767 + 1) / 2 * (max - min). Entity-local, like the collision shapes.
 - Partitioner: a tree over the edges, nodes stored children first with the root last (RootIndex). NodeType 0 is a
@@ -33,6 +36,7 @@ from .geom import mesh_shape_geometry
 from .schema import type_name
 
 LEDGE = 1
+POLE = 4
 SUBTYPE_NAMES = {1: "ledge", 2: "beam", 3: "ladder", 4: "pole", 5: "rope", 6: "surface", 8: "kiosk", 13: "haystack"}
 DEFAULT_SLOPE_COS = math.cos(math.radians(45))
 WELD = 1e-3            # vertex weld tolerance (m)
@@ -42,6 +46,11 @@ MIN_DROP = 0.2         # and this much wall below it, or it's a step (m)
 REACH_CAP = 2.0        # depth/drop are measured over connected faces up to this far (m)
 STEEP_Z = 0.5          # a face with normal z below this can be the wall side of a ledge
 MERGE_COS = 0.999      # collinear and same-normal tolerance when merging edges
+POLE_MAX_WIDTH = 0.12  # a walkable strip at most this wide between two opposite edges is a pole (m; retail: 0.10)
+POLE_MAX_DROP = 0.5    # ... if its sides are a bar's thickness, not a wall (m)
+POLE_MIN_DROP = 0.2    # ... and not a decorative strip (m; retail: 0.30)
+POLE_MIN_LENGTH = 0.5  # ... and long enough to swing on (m)
+MAX_EDGE_SLOPE = 0.7   # edges steeper than this (|direction z|) aren't ledges
 
 
 @dataclass
@@ -121,7 +130,7 @@ def slope_cos(g: Obj | None) -> float:
 
 def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: float = MIN_DEPTH,
              min_drop: float = MIN_DROP) -> list[Edge]:
-    """Ledge edges of a triangle mesh (entity-local). Compared with the retail edges on the retail maps' own
+    """Ledge and pole edges of a triangle mesh (entity-local). Compared with the retail edges on the retail maps' own
     geometry, the depth/drop filters keep about two thirds of the edges retail has and drop about three quarters
     of those it doesn't (the rest depends on neighbouring geometry, which this doesn't see)."""
     # weld
@@ -182,6 +191,11 @@ def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: floa
         if _dot(n0, _sub(wv[far1], wv[u])) > -1e-4 or _dot(n1, _sub(wv[far0], wv[u])) > -1e-4:
             continue
         t = _norm(_sub(wv[v], wv[u]))
+        if abs(t[2]) > MAX_EDGE_SLOPE:
+            continue
+        inward = _norm((-t[1], t[0], 0.0))
+        if _dot(inward, _sub(wv[far0], wv[u])) < 0:
+            inward = (-inward[0], -inward[1], 0.0)
 
         def reach(p, u=u, t=t):   # horizontal distance of p from the edge line
             r = _sub(p, wv[u])
@@ -192,9 +206,75 @@ def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: floa
         depth = spread(f0, lambda f: normals[f][2] >= slope_cos_, reach)
         drop = spread(f1, lambda f: normals[f][2] <= STEEP_Z and all(wv[i][2] <= top + 1e-3 for i in faces[f]),
                       lambda p, top=top: top - p[2])
-        raw.append(Edge(wv[u], wv[v], n0, n1, LEDGE, depth, drop))
-    return [e for e in _merge(raw)
-            if math.dist(e.p0, e.p1) >= MIN_EDGE and e.depth >= min_depth and e.drop >= min_drop]
+        raw.append(Edge(wv[u], wv[v], n0, inward, LEDGE, depth, drop))
+    merged = [e for e in _merge(raw) if math.dist(e.p0, e.p1) >= MIN_EDGE]
+    poles = _find_poles(merged)
+    return [e for i, e in enumerate(merged)
+            if (i in poles and e.drop > 0) or (e.depth >= min_depth and e.drop >= min_drop)]
+
+
+HANG_OUT = 0.15        # hang-space probe: this far out from the edge (m)
+HANG_DOWN = 0.3        # ... and this far below it (m)
+HANG_CLEAR = 0.1       # other objects' geometry closer than this to the probe blocks the edge (m)
+DROP_OUT = 0.25        # drop ray starts this far out from the edge (m)
+
+
+def world_filter(edge_list: list[Edge], world, matrix: bytes, key, min_drop: float = MIN_DROP) -> list[Edge]:
+    """Drop edges that the rest of the map makes useless: the space a climber hangs in is taken by another object,
+    or there's ground (anyone's) less than min_drop below the edge. world: acbmap.world.WorldCollision."""
+    import numpy as np
+    from .world import to_world
+    M = to_world(matrix)
+    R, t = M[:3, :3], M[:3, 3]
+    out = []
+    for e in edge_list:
+        p0, p1 = np.asarray(e.p0), np.asarray(e.p1)
+        outward = -np.asarray(e.n1)
+        ok = 0
+        for f in (0.25, 0.5, 0.75):
+            s_ = p0 + (p1 - p0) * f
+            hang = R @ (s_ + outward * HANG_OUT - np.array([0, 0, HANG_DOWN])) + t
+            blocked = world.distance(hang, HANG_CLEAR, exclude_key=key) < HANG_CLEAR
+            g = world.ground_below(R @ (s_ + outward * DROP_OUT - np.array([0, 0, 0.02])) + t)
+            low = g is not None and g + 0.02 < (min_drop if e.subtype == LEDGE else POLE_MIN_DROP)
+            ok += not blocked and not low
+        if ok >= 2:
+            out.append(e)
+    return out
+
+
+def _pole_side(e: Edge) -> bool:
+    return (e.depth <= POLE_MAX_WIDTH + 0.02 and POLE_MIN_DROP <= e.drop <= POLE_MAX_DROP
+            and math.dist(e.p0, e.p1) >= POLE_MIN_LENGTH)
+
+
+def _find_poles(edges_: list[Edge]) -> set[int]:
+    """Indices of edges that pair up across a thin bar: parallel, same top, inward directions facing each other,
+    overlapping, at most POLE_MAX_WIDTH apart. They become poles."""
+    out = set()
+    for i, a in enumerate(edges_):
+        if not _pole_side(a):
+            continue
+        ta = _norm(_sub(a.p1, a.p0))
+        for j in range(i + 1, len(edges_)):
+            b = edges_[j]
+            if not _pole_side(b) or _dot(a.n0, b.n0) < MERGE_COS or _dot(a.n1, b.n1) > -MERGE_COS:
+                continue
+            tb = _norm(_sub(b.p1, b.p0))
+            if abs(_dot(ta, tb)) < MERGE_COS:
+                continue
+            gap = _dot(_sub(b.p0, a.p0), a.n1)      # across the bar, along a's inward direction
+            if not 0 < gap <= POLE_MAX_WIDTH:
+                continue
+            # overlap along the bar
+            s0, s1 = sorted((_dot(_sub(b.p0, a.p0), ta), _dot(_sub(b.p1, a.p0), ta)))
+            la = math.dist(a.p0, a.p1)
+            if min(s1, la) - max(s0, 0.0) < 0.5 * min(la, math.dist(b.p0, b.p1)):
+                continue
+            out |= {i, j}
+    for i in out:
+        edges_[i].subtype = POLE
+    return out
 
 
 def _merge(raw: list[Edge]) -> list[Edge]:
@@ -295,7 +375,8 @@ def template_system(doc: MapDocument) -> Obj:
     raise ValueError("no retail GuidanceSystem in this map to use as a template")
 
 
-def regenerate(doc: MapDocument, key, fresh_ids, min_depth: float = MIN_DEPTH, min_drop: float = MIN_DROP) -> int:
+def regenerate(doc: MapDocument, key, fresh_ids, min_depth: float = MIN_DEPTH, min_drop: float = MIN_DROP,
+               world=None) -> int:
     """Replace an element's climb edges with ones generated from its collision shapes (one GuidanceSystem per
     InertComponent with a MeshShape, linked from it). Returns the number of edges; marks the root touched."""
     from .ops import element_obj, inert_components, strip_guidance
@@ -312,6 +393,8 @@ def regenerate(doc: MapDocument, key, fresh_ids, min_depth: float = MIN_DEPTH, m
             continue
         v, t, _m = mesh_shape_geometry(doc.obj(sid))
         el = generate(v, t, cos_, min_depth, min_drop)
+        if world is not None:
+            el = world_filter(el, world, o.fields["GlobalMatrix"], key, min_drop)
         if not el:
             continue
         ids = fresh_ids(doc, 2)

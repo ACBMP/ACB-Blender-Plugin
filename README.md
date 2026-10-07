@@ -57,9 +57,10 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      faces to the collision material slots. Shapes are shared between objects as in the game; **Make Shape
      Unique** splits one off. **Mesh to Collision** turns any plain mesh into new static collision, with climb
      edges.
-   - Climb edges (ledges): **Show Climb Edges** draws them. **Generate Climb Edges** rebuilds the selected
-     elements' ledges from their own collision (adjust *Min ledge depth* / *Min wall drop* in the redo panel);
-     **Remove Climb Edges** drops them. After reshaping collision that has ledges, Apply reports them as stale.
+   - Climb edges (ledges and swing poles): **Show Climb Edges** draws them. **Generate Climb Edges** rebuilds the
+     selected elements' edges from their collision, leaving out ledges whose hanging space another object takes or
+     that sit less than the minimum drop above any floor (adjust *Min ledge depth* / *Min wall drop* / *Use
+     surrounding geometry* in the redo panel); **Remove Climb Edges** drops them. After reshaping collision that has ledges, Apply reports them as stale.
    - Trigger zones (cube/sphere empties under their element) and out-of-bounds wall quads: move or scale them.
    - **Add Element**: places a copy of one of the map's own spawns, benches, haystacks, chase breakers, etc. at
      the 3D cursor.
@@ -105,11 +106,11 @@ acbmap install <forge> | uninstall <name> | status
   diffuse texture (blend spots, decals, FX planes) show plain white.
 - **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle refs. NPCs ignore
   new collision.
-- **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. Generated
-  edges are ledges only (no beams, poles or ropes), taken from the entity's own collision. Ubisoft's tool also used
-  neighbouring geometry, so regenerating a retail object changes its ledges: on San Marco, Mont St-Michel and
-  Firenze about 11% of the retail ledge length is reproduced, and most generated ledges aren't in retail. Not yet
-  tested in game.
+- **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. The
+  generator makes ledges and swing poles (the only other type the MP maps use; poles match retail's: 186 of 190
+  found, 178 of 184 generated are retail poles). Ledges follow physical rules, but retail's were placed by hand:
+  facades get a ledge on every cornice where retail often has a few, so regenerating a retail object changes how it
+  climbs (about a quarter of retail ledge length is reproduced within 15 cm). Not yet tested in game.
 - Out-of-bounds quads: position, rotation and size round-trip exactly. Whether the stored position is the wall's
   bottom or its centre isn't verified in-game, so the drawn quad may sit half a height off.
 - Group children can't be copied on their own; copy the whole group.

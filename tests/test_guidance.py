@@ -25,6 +25,17 @@ def test_box_has_four_top_ledges():
     for e in el:
         assert e.p0[2] == e.p1[2] == 2
         assert e.n0 == (0.0, 0.0, 1.0) and abs(e.n1[2]) < 1e-9
+        mid = [(a + b) / 2 for a, b in zip(e.p0, e.p1)]
+        assert all(0 <= m + 0.5 * n <= 2 for m, n in zip(mid[:2], e.n1[:2])), "second normal points inward"
+        assert e.subtype == G.LEDGE
+
+
+def test_thin_bar_is_a_pole():
+    bar = [(x * 1.0, y * 0.05, z * 0.15 - 0.3) for x, y, z in BOX_V]   # 2 m x 10 cm x 30 cm, like retail poles
+    el = G.generate(bar, BOX_T)
+    poles = [e for e in el if e.subtype == G.POLE]
+    assert len(poles) == 2 and all(round(math.dist(e.p0, e.p1), 3) == 2.0 for e in poles)
+    assert poles[0].n1[1] == -poles[1].n1[1] != 0
 
 
 def test_step_is_not_a_ledge():
@@ -80,3 +91,25 @@ def _shape(d, e):
     sid = u32(ops.inert_components(e.obj)[0][1].fields["RigidBody"].fields["Shape"].id)
     v, t, _ = mesh_shape_geometry(d.obj(sid))
     return v, t
+
+
+class StubWorld:
+    """WorldCollision stand-in: a floor at floor_z everywhere, other geometry at a fixed distance."""
+    def __init__(self, floor_z=None, other=float("inf")):
+        self.floor_z, self.other = floor_z, other
+
+    def ground_below(self, p, max_dist=50.0):
+        return None if self.floor_z is None or p[2] < self.floor_z else p[2] - self.floor_z
+
+    def distance(self, p, radius, exclude_key=None):
+        return self.other
+
+
+def test_world_filter():
+    import struct
+    ident = struct.pack("<16f", 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
+    el = G.generate(BOX_V, BOX_T)                     # ledges at z = 2
+    assert len(G.world_filter(el, StubWorld(), ident, None)) == 4
+    assert len(G.world_filter(el, StubWorld(floor_z=0.0), ident, None)) == 4          # 2 m drop: fine
+    assert G.world_filter(el, StubWorld(floor_z=1.9), ident, None) == []              # a floor 10 cm below
+    assert G.world_filter(el, StubWorld(other=0.02), ident, None) == []               # hang space taken

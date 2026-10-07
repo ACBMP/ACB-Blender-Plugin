@@ -342,6 +342,14 @@ class Session:
         self.mesh_base[me.name] = mesh_hash(me)
         return me
 
+    def world_collision(self):
+        """The map's collision in world space as the document has it now (built per call: edits move things)."""
+        try:
+            from acbmap.world import WorldCollision
+        except ImportError:   # no numpy: the generator falls back to the entity's own geometry
+            return None
+        return WorldCollision(self.doc)
+
     def climb_object(self, entity, ob, k):
         """(Re)build the line object showing an element's climb edges (entity-local, so parented with no offset)."""
         old = bpy.data.objects.get(f"{ob.name}:climb")
