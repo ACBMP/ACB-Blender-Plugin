@@ -1,7 +1,8 @@
 """blender --background --factory-startup --python tests/blender_smoke.py -- <forge>
 
 Drives the add-on the way a user would: open a map, move a spawn, Shift+D a spawn and a chest, delete a spawn,
-reshape a collision mesh and a trigger zone, save; then reopens the saved forge headless and checks every edit."""
+reshape a collision mesh and a trigger zone, move and Shift+D a piece of scenery (shown by its visual mesh), save;
+then reopens the saved forge headless and checks every edit."""
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ kinds = {}
 for o in objs:
     kinds.setdefault(o["acb_kind"], []).append(o)
 print("SMOKE kinds", {k: len(v) for k, v in sorted(kinds.items())})
+vis = [o for o in objs if o.type == "MESH" and "acb_visual" in o.data]
 
 def copy(ob):
     c = ob.copy()
@@ -48,11 +50,20 @@ dup_xyz = tuple(dup.matrix_world.translation)
 deleted_key = sp[2]["acb_key"]
 bpy.data.objects.remove(sp[2])
 chest = copy(kinds["chest_spawn"][0]); chest.location.y += 4
-col = next(o for o in kinds["collision"] if o.type == "MESH" and o.data.users == 1)
+col = next(o for o in bpy.context.scene.objects
+           if o.type == "MESH" and "acb_shape" in o.data and o.data.users == 1 and "acb_key" in o)
 col.data.vertices[0].co.z += 0.5
 shape = int(col.data["acb_shape"], 16)
 zone = next(o for o in bpy.context.scene.objects if o.get("acb_part", "").startswith("zone:"))
 zone.scale *= 1.5
+print("SMOKE visual elements", len(vis), "meshes", sum("acb_visual" in m for m in bpy.data.meshes),
+      "textures", sum(i.name.startswith("ACBTex_") for i in bpy.data.images))
+scen = next(o for o in vis if o["acb_kind"] == "visual" and S.parse_key(o["acb_key"])[1] < 0)
+scen.location.x += 2.0
+scen_dup = copy(next(o for o in vis if o["acb_kind"] == "collision" and S.parse_key(o["acb_key"])[1] < 0))
+scen_dup.location.y += 7.0
+bpy.context.view_layer.update()
+scen_key, scen_x = scen["acb_key"], scen.matrix_world.translation.x
 log = s.sync()
 print("SMOKE log", log)
 out = os.path.join(os.path.dirname(s.doc.cache), "edited", "smoke_" + os.path.basename(forge))
@@ -72,8 +83,11 @@ check(abs(position(d.obj(mk[0]).fields["GlobalMatrix"])[2] - moved_z) < 1e-3, "m
 check(S.parse_key(deleted_key)[0] not in d.info, "deleted spawn gone")
 check(any(all(abs(a - b) < 1e-3 for a, b in zip(e.position, dup_xyz)) for e in spawns), "duplicated spawn present")
 check(any(l.startswith("moved ") for l in log), "move was detected")
+check(abs(position(d.obj(S.parse_key(scen_key)[0]).fields["GlobalMatrix"])[0] - scen_x) < 1e-3, "moved scenery x")
+check(S.parse_key(scen_dup["acb_key"])[0] in d.info, "duplicated scenery present")
+check(len(vis) > 100 and all(len(o.data.polygons) for o in vis), "visual meshes built")
 check(not any("out-of-bounds" in l for l in log), "untouched out-of-bounds sections not rewritten")
-check(sum(l.startswith("moved ") for l in log) == 1, "only the moved element is moved")
+check(sum(l.startswith("moved ") for l in log) == 2, "only the moved elements are moved")
 check(abs(mesh_shape_geometry(d.obj(shape))[0][0][2] - col.data.vertices[0].co.z) < 1e-4, "collision vertex")
 from acbmap.worlddata import WorldData
 w = WorldData(d, os.path.dirname(forge))

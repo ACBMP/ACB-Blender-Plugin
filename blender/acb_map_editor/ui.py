@@ -53,6 +53,8 @@ class ACB_OT_open_map(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     filter_glob: bpy.props.StringProperty(default="*.forge", options={"HIDDEN"})
     with_collision: bpy.props.BoolProperty(name="Collision geometry", default=True)
+    with_visuals: bpy.props.BoolProperty(name="Visual meshes", default=True,
+                                         description="Show the map's textured meshes (most detailed LOD)")
 
     def invoke(self, context, event):
         if not self.filepath:
@@ -66,7 +68,7 @@ class ACB_OT_open_map(bpy.types.Operator):
         wm.progress_begin(0, 1)
         try:
             s = S.Session(context.scene, self.filepath)
-            s.build(self.with_collision, progress=wm.progress_update)
+            s.build(self.with_collision, self.with_visuals, progress=wm.progress_update)
         except Exception as ex:
             traceback.print_exc()
             self.report({"ERROR"}, f"open failed: {ex}")
@@ -75,6 +77,17 @@ class ACB_OT_open_map(bpy.types.Operator):
             wm.progress_end()
         n = len(s.objects)
         self.report({"INFO"}, f"{os.path.basename(self.filepath)}: {n} editable objects")
+        return {"FINISHED"}
+
+
+class ACB_OT_toggle_collision(bpy.types.Operator):
+    """Show or hide the collision meshes (hidden while visual meshes are shown; unhide them to edit collision)"""
+    bl_idname = "acb.toggle_collision"
+    bl_label = "Show Collision"
+
+    def execute(self, context):
+        s = sess(context)
+        s.set_collision_visible(not s.collision_visible())
         return {"FINISHED"}
 
 
@@ -290,8 +303,8 @@ class ACB_OT_make_unique(bpy.types.Operator):
     def execute(self, context):
         s = sess(context)
         ob, key = active_element(context)
-        if ob is None or ob.type != "MESH":
-            self.report({"ERROR"}, "select a collision mesh")
+        if ob is None or ob.type != "MESH" or "acb_shape" not in ob.data:
+            self.report({"ERROR"}, "select a collision mesh (unhide the Collision collection to reach it)")
             return {"CANCELLED"}
         s.sync()
         part = ob.get("acb_part", "")
@@ -555,6 +568,9 @@ class ACB_PT_tools(ACBPanel, bpy.types.Panel):
         col.operator("acb.add_element", icon="ADD")
         col.label(text="Shift+D copies an element, X deletes it (on Apply)")
         col.separator()
+        vis = s.collision_visible() if (s := sess(context)) is not None else True
+        col.operator("acb.toggle_collision", text="Hide Collision" if vis else "Show Collision",
+                     icon="HIDE_OFF" if vis else "HIDE_ON")
         col.operator("acb.new_collision", icon="MESH_CUBE")
         col.operator("acb.make_unique", icon="DUPLICATE")
         col.operator("acb.strip_guidance", icon="X")
@@ -642,7 +658,7 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
                 row.label(text=f"{r.label}: {r.text[:50]}")
 
 
-CLASSES = (ACB_OT_open_map, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
+CLASSES = (ACB_OT_open_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
            ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_make_unique, ACB_OT_strip_guidance,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_add_selected, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,

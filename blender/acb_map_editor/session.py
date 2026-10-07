@@ -5,10 +5,14 @@ Every Blender object that stands for something in the forge carries string custo
 32-bit signed, ids aren't):
   acb_key   "<root uid hex>:<child index>"  -- an element (Entity / EntityGroup root, or a group child)
   acb_kind  element kind (kinds.py)
-  acb_part  "" for the element itself; "shape:<n>" collision shape of a multi-shape element; "zone:<path>" a trigger
-            zone (path into the element, '/'-separated); "oob:<n>" an out-of-bounds wall section
+  acb_part  "" for the element itself; "shape:<n>" collision shape of a multi-shape element (or of any element shown
+            by its visual mesh); "zone:<path>" a trigger zone (path into the element, '/'-separated); "oob:<n>" an
+            out-of-bounds wall section
 Collision mesh datablocks carry acb_shape (MeshShape uid hex) and are shared between every entity using the shape,
-like in the game. Shift+D on an element creates a new element on save; deleting the Blender object deletes it.
+like in the game; visual mesh datablocks carry acb_visual (Mesh uid hex) and are shared the same way, but are
+display-only. An element with a visual mesh is that mesh (so clicking the scenery selects it), with its collision as
+child objects in the Collision collection, which is hidden while visuals are shown. Shift+D on an element creates a
+new element on save; deleting the Blender object deletes it.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ import bpy
 from mathutils import Matrix, Quaternion, Vector
 
 from acbmap import ops
+from acbmap import visual as V
 from acbmap.doc import MapDocument, u32
 from acbmap.geom import from_blender, mesh_shape_geometry, set_mesh_shape_geometry, to_blender
 from acbmap.kinds import classify, component, components, group_children
@@ -33,6 +38,7 @@ KIND_COLLECTIONS = {
     "chase_breaker": "Chase Breakers", "elevator": "Interactive", "bench": "Interactive",
     "blend_group": "Interactive", "freerun_magnet": "Parkour", "corner_spin": "Parkour",
     "haystack": "Interactive", "hiding_place": "Interactive", "chase_breaker_door": "Chase Breakers",
+    "visual": "Scenery", "other": "Scenery",
 }
 EMPTY_STYLE = {
     "spawn": ("SINGLE_ARROW", 1.5), "chest_spawn": ("CUBE", 0.6), "crowd_flow": ("PLAIN_AXES", 0.4),
@@ -40,7 +46,8 @@ EMPTY_STYLE = {
     "chase_breaker": ("ARROWS", 1.0), "elevator": ("CONE", 1.0), "bench": ("CUBE", 0.5),
     "blend_group": ("SPHERE", 1.0), "freerun_magnet": ("SPHERE", 0.4), "haystack": ("CUBE", 0.8),
 }
-SKIP_KINDS = {"visual", "other"}      # no shape, no gameplay: not imported in milestone 1
+SKIP_KINDS = {"visual", "other"}      # no shape, no gameplay: imported only when they have a visual mesh
+WIRE_VISUAL_KINDS = {"out_of_bounds"}   # visual = the boundary fog wall: a wireframe child, the element stays an empty
 LOCKED_KINDS = {"crowd_flow", "nav_flow"}   # their points carry navmesh triangle refs: moving them breaks the crowd
 
 SESSIONS: dict[str, "Session"] = {}
@@ -69,6 +76,16 @@ def mesh_hash(me) -> str:
         h.update(struct.pack(f"<{len(p.vertices)}I", *p.vertices))
         h.update(struct.pack("<H", p.material_index))
     return h.hexdigest()
+
+
+def show_textures():
+    """Solid-mode 3D views colour by texture, so the scenery reads without switching to Material Preview."""
+    for win in getattr(bpy.context.window_manager, "windows", []):
+        for area in win.screen.areas:
+            if area.type == "VIEW_3D":
+                for sp in area.spaces:
+                    if sp.type == "VIEW_3D":
+                        sp.shading.color_type = "TEXTURE"
 
 
 def get(scene) -> "Session | None":
@@ -104,7 +121,9 @@ class Session:
             root.children.link(c)
         return c
 
-    def build(self, with_collision=True, progress=None):
+    def build(self, with_collision=True, with_visuals=True, progress=None):
+        self.with_collision = with_collision
+        self.with_visuals = with_visuals
         self.tag = os.path.basename(self.source).replace("DataPC_", "").replace(".forge", "")
         self.root_coll = bpy.data.collections.get(f"ACB {self.tag}")
         if self.root_coll is None:
@@ -116,9 +135,11 @@ class Session:
         for i, e in enumerate(sorted(elements, key=lambda e: e.child)):   # roots before group children
             if progress and i % 200 == 0:
                 progress(i / max(n, 1))
-            if e.kind in SKIP_KINDS and e.child < 0 and type_name(e.obj.type_hash) != "EntityGroup":
+            has_visual = with_visuals and bool(V.entity_meshes(self.doc, e.obj))
+            if (e.kind in SKIP_KINDS and e.child < 0 and type_name(e.obj.type_hash) != "EntityGroup"
+                    and not has_visual):
                 continue
-            if e.kind == "collision" and not with_collision:
+            if e.kind == "collision" and not with_collision and not has_visual:
                 continue
             ob = self._element_object(e)
             if ob is None:
@@ -130,15 +151,59 @@ class Session:
                 roots_obj[e.uid] = ob
         self._build_flow_links()
         self._build_vip_curves()
+        if with_visuals:
+            self.set_collision_visible(False)
+            show_textures()
         self.snapshot()
+
+    def set_collision_visible(self, visible: bool):
+        """Show or hide the Collision collection (hidden by default while visual meshes are shown)."""
+        name = f"Collision [{self.tag}]"
+
+        def find(lc):
+            if lc.collection.name == name:
+                return lc
+            for c in lc.children:
+                r = find(c)
+                if r is not None:
+                    return r
+            return None
+        for vl in self.scene.view_layers:
+            lc = find(vl.layer_collection)
+            if lc is not None:
+                lc.hide_viewport = not visible
+
+    def collision_visible(self) -> bool:
+        lc = bpy.context.view_layer.layer_collection
+        stack = [lc]
+        while stack:
+            c = stack.pop()
+            if c.collection.name == f"Collision [{self.tag}]":
+                return not c.hide_viewport
+            stack += list(c.children)
+        return True
 
     def _element_object(self, e):
         k = keystr(e.key)
         shapes = [(i, ic) for i, ic in ops.inert_components(e.obj)]
-        coll = self.coll(KIND_COLLECTIONS.get(e.kind, "Other"))
+        if not getattr(self, "with_collision", True):
+            shapes = []
+        visuals = []
+        if getattr(self, "with_visuals", False):
+            visuals = [m for m in (self._visual_mesh(u) for u in V.entity_meshes(self.doc, e.obj)) if m is not None]
+        coll_name = KIND_COLLECTIONS.get(e.kind, "Other")
+        if visuals and coll_name == "Collision":
+            coll_name = "Scenery"   # the Collision collection gets hidden; the scenery itself must stay visible
+        coll = self.coll(coll_name)
         name = self.doc.name_of(e.uid) if e.child < 0 else f"{self.doc.name_of(e.uid)}/{e.child}"
         mw = Matrix(to_blender(e.obj.fields["GlobalMatrix"]))
-        if e.kind == "collision" and len(shapes) == 1:
+        wire_visuals = []
+        if e.kind in WIRE_VISUAL_KINDS:
+            wire_visuals, visuals = visuals, []
+        if visuals:
+            ob = bpy.data.objects.new(name, visuals[0])
+            shape_children = shapes
+        elif e.kind == "collision" and len(shapes) == 1:
             me = self._shape_mesh(shapes[0][1])
             if me is None:
                 return None
@@ -172,7 +237,21 @@ class Session:
             ch.parent = ob
             ch["acb_key"] = k
             ch["acb_part"] = f"shape:{si}"
-            ch.hide_select = e.kind not in ("collision",)
+            ch.hide_select = e.kind not in ("collision", "visual", "other")
+        for vi, me in enumerate(visuals[1:], 1):
+            # further Visual components: display-only children (no acb_key, so they're never taken for elements)
+            ch = bpy.data.objects.new(f"{name}:visual{vi}", me)
+            coll.objects.link(ch)
+            ch.parent = ob
+            ch.hide_select = True
+            ch["acb_visual_of"] = k
+        for vi, me in enumerate(wire_visuals):
+            ch = bpy.data.objects.new(f"{name}:visual{vi}", me)
+            coll.objects.link(ch)
+            ch.parent = ob
+            ch.hide_select = True
+            ch.display_type = "WIRE"
+            ch["acb_visual_of"] = k
         self._zones(e, ob, k)
         if e.kind == "out_of_bounds":
             self._oob_sections(e, ob, k)
@@ -199,6 +278,86 @@ class Session:
         me["acb_shape"] = f"{sid:08x}"
         self.mesh_base[me.name] = mesh_hash(me)
         return me
+
+    def _visual_mesh(self, uid: int):
+        """The Blender mesh of a visual Mesh (LOD0), built once and shared by every entity showing it."""
+        mname = f"ACBVis_{uid:08x}"
+        me = bpy.data.meshes.get(mname)
+        if me is not None:
+            return me
+        if uid in getattr(self, "_no_visual", ()):
+            return None
+        g = V.mesh_geometry(self.doc, uid)
+        if g is None or not g.tris:
+            self.__dict__.setdefault("_no_visual", set()).add(uid)
+            return None
+        me = bpy.data.meshes.new(mname)
+        me.from_pydata(g.verts, [], g.tris)
+        uv = me.uv_layers.new(name="UVMap")
+        lv = [0] * len(me.loops)
+        me.loops.foreach_get("vertex_index", lv)
+        uv.data.foreach_set("uv", [c for i in lv for c in g.uvs[i]])
+        for mid in g.materials:
+            me.materials.append(self._vis_material(mid) if mid else None)
+        if len(g.materials) > 1:
+            me.polygons.foreach_set("material_index", g.tri_material)
+        me.shade_smooth()
+        me.normals_split_custom_set_from_vertices(g.normals)
+        me.update()
+        me["acb_visual"] = f"{uid:08x}"
+        return me
+
+    def _vis_material(self, mid: int):
+        nm = self.doc.name_of(mid) if mid in self.doc.info else f"{mid:08x}"
+        mat = bpy.data.materials.get(f"ACBMat_{nm}")
+        if mat is not None:
+            return mat
+        mat = bpy.data.materials.new(f"ACBMat_{nm}")
+        mat["acb_vis_material"] = f"{mid:08x}"
+        mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        img = self._texture_image(V.material_texture(self.doc, mid, 0))
+        flags = V.material_flags(self.doc, mid)
+        if bsdf is not None:
+            bsdf.inputs["Roughness"].default_value = 0.8
+        if img is not None and bsdf is not None:
+            tex = nt.nodes.new("ShaderNodeTexImage")
+            tex.image = img
+            tex.location = (-320, 260)
+            nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+            if flags.get("alpha_test") or flags.get("blend_mode"):
+                nt.links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
+                if hasattr(mat, "surface_render_method"):
+                    mat.surface_render_method = "DITHERED"
+                else:
+                    mat.blend_method = "CLIP"
+        mat.use_backface_culling = not flags.get("two_sided", False)
+        return mat
+
+    def _texture_image(self, tid: int | None):
+        if tid is None:
+            return None
+        nm = f"ACBTex_{self.doc.name_of(tid)}"
+        img = bpy.data.images.get(nm)
+        if img is not None:
+            return img
+        d = os.path.join(self.doc.cache, "tex")
+        path = os.path.join(d, f"{tid:08x}.dds")
+        if not os.path.exists(path):
+            data = V.texture_dds(self.doc, tid)
+            if data is None:
+                return None
+            os.makedirs(d, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+        try:
+            img = bpy.data.images.load(path)
+        except RuntimeError:
+            return None
+        img.name = nm
+        return img
 
     def _col_material(self, mid: int):
         nm = self.doc.name_of(mid) if mid in self.doc.info else f"{mid:08x}"
@@ -417,7 +576,7 @@ class Session:
                     continue
                 ob["acb_key"] = keystr(nk)
                 self.objects[keystr(nk)] = ob.name
-                if ob.type == "MESH" and orig.type == "MESH" and ob.data != orig.data:
+                if ob.type == "MESH" and orig.type == "MESH" and ob.data != orig.data and "acb_shape" in orig.data:
                     # Blender copied the mesh: give the new element its own MeshShape so editing one
                     # doesn't change the other
                     sid = ops.make_shape_unique(doc, nk)

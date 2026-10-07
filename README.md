@@ -48,13 +48,14 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
 ## Workflow (Blender)
 
 1. **Open ACB Map**: pick a `DataPC_*.forge`. The first open unpacks it into `~/.cache/acbmap/` (a few seconds);
-   after that, opening is near-instant.
+   after that, opening is near-instant. The map shows its textured visual meshes (most detailed LOD), and solid
+   shading is switched to texture colour. Untick *Visual meshes* in the file dialog for the collision-only view.
 2. Edit:
    - Move, rotate or scale elements as usual. **Shift+D** copies an element, **X** deletes it. Moving a group moves
-     its children.
-   - Collision meshes: use edit mode, and assign faces to the collision material slots. Shapes are shared between
-     objects as in the game; **Make Shape Unique** splits one off. **Mesh to Collision** turns any plain mesh
-     into new static collision.
+     its children. Scenery is selectable too: clicking a building selects its entity.
+   - Collision meshes: **Show Collision** (they're hidden while visuals are shown), then use edit mode and assign
+     faces to the collision material slots. Shapes are shared between objects as in the game; **Make Shape
+     Unique** splits one off. **Mesh to Collision** turns any plain mesh into new static collision.
    - Trigger zones (cube/sphere empties under their element) and out-of-bounds wall quads: move or scale them.
    - **Add Element**: places a copy of one of the map's own spawns, benches, haystacks, chase breakers, etc. at
      the 3D cursor.
@@ -93,8 +94,10 @@ acbmap install <forge> | uninstall <name> | status
 
 ## Known limits (milestone 1)
 
-- **No visual meshes:** you see collision only. Moved or added collision has no visible geometry, and visible
-  geometry you remove still renders.
+- **Visual meshes are display-only.** Moving, copying or deleting an entity carries its visual along, but the meshes
+  themselves can't be edited, and new collision (Mesh to Collision) has no visible geometry in game. Skinned meshes
+  (elevators, crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Only the diffuse texture is
+  used, and materials without one (blend spots, decals, FX planes) show plain white.
 - **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle refs. NPCs ignore
   new collision.
 - **Climb edges** (GuidanceSystem: ledges, beams, poles, haystacks) are precomputed per entity. Moving an entity
