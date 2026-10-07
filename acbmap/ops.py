@@ -13,6 +13,7 @@ import copy
 
 from anvilforge.fastload import Handle, Obj, Ptr, Ref, Root, walk
 
+from .datafile import DataFile
 from .doc import MapDocument, idb, u32
 from .geom import matrix_rows, pack_floats
 from .kinds import group_children
@@ -49,11 +50,12 @@ def all_ids(doc: MapDocument) -> set[int]:
 def fresh_ids(doc: MapDocument, n: int) -> list[int]:
     used = all_ids(doc)
     base = id_base(doc)
-    i = base
+    i = max(base, getattr(doc, "_id_cursor", base))   # ids below the cursor are taken: big imports stay linear
     while True:
         block = list(range(i, i + n))
         if not any(b in used for b in block):
             used.update(block)
+            doc._id_cursor = i + n
             return block
         i += n
         if i + n > base + 0x10000:
@@ -84,6 +86,100 @@ def owning_block(doc: MapDocument, uid: int) -> int | None:
         if any(u32(r.id) == uid for r in doc.obj(b).fields["Objects"]):
             return b
     return None
+
+
+# ------------------------------------------------------------------ compound collision --
+#
+# Most retail static collision is merged per area: an Entity with a MultiInertComponent holds a MultiMeshShape listing
+# member entities (ContainedEntities/ContainedShapes) plus one MOPP compiled over all of them, and each member's
+# InertComponent has IsMerged=1. At load (MultiInertComponent::OnAddToWorld) the compound copies every member's
+# shape at its current matrix and uses the stored MOPP as is (RebuildMopp only runs at editor time); a merged
+# InertComponent never adds its own rigid body (InertComponent::AddToWorldInternal checks +0x105 = IsMerged). So a
+# moved or reshaped member collides wrongly, a deleted one leaves a dangling handle, and a copy that keeps IsMerged=1
+# has no collision at all. Editing a member therefore dissolves its compound: the compound entity goes, and its
+# members become standalone (IsMerged=0), each with its own rigid body and MeshShape MOPP.
+
+def _sub_index(doc: MapDocument) -> dict[int, tuple[int, int]]:
+    """entity id -> element key, for roots and group children."""
+    from .kinds import classify
+    return {u32(e.obj.id): e.key for e in classify(doc)}
+
+
+def compounds(doc: MapDocument) -> dict[int, list[int]]:
+    """compound entity uid -> member entity ids (cached; dissolve_compound keeps it current)."""
+    if getattr(doc, "_compounds", None) is None:
+        out = {}
+        for u in doc.uids("Entity"):
+            o = doc.obj(u)
+            if o is None:
+                continue
+            for p in o.fields.get("Components", []):
+                c = getattr(p, "obj", None)
+                if c is not None and type_name(c.type_hash) == "MultiInertComponent":
+                    for ms in walk(c):
+                        if type_name(ms.type_hash) == "MultiMeshShape":
+                            out.setdefault(u, []).extend(u32(h.id) for h in ms.fields["ContainedEntities"])
+        doc._compounds = out
+    return doc._compounds
+
+
+def compound_of(doc: MapDocument, entity_id: int) -> int | None:
+    return next((m for m, mem in compounds(doc).items() if entity_id in mem), None)
+
+
+def unmerge(o: Obj) -> bool:
+    """IsMerged=0 on every InertComponent of an entity (it then adds its own rigid body)."""
+    changed = False
+    for _i, ic in inert_components(o):
+        if ic.fields.get("IsMerged", b"\x00") != b"\x00":
+            ic.fields["IsMerged"] = b"\x00"
+            changed = True
+    return changed
+
+
+def dissolve_compound(doc: MapDocument, multi_uid: int, remove: bool = True) -> int:
+    """Make a compound's members standalone collision and (remove=True) delete the compound entity. Returns the
+    number of members unmerged."""
+    members = compounds(doc).pop(multi_uid, [])
+    idx = _sub_index(doc)
+    n = 0
+    for m in members:
+        k = idx.get(m)
+        if k is None:
+            continue
+        if unmerge(element_obj(doc, k)):
+            doc.touch(k[0])
+            n += 1
+    if remove and multi_uid in doc.info:
+        _remove_from_blocks(doc, {multi_uid})
+        doc.remove_root(multi_uid)
+    return n
+
+
+def ensure_standalone(doc: MapDocument, key) -> int | None:
+    """Before moving/reshaping/deleting an element: dissolve the compound(s) holding it or (for a group) any of its
+    children. Returns a dissolved compound uid, if any."""
+    o = element_obj(doc, key)
+    ids = {u32(o.id)}
+    if key[1] < 0 and type_name(o.type_hash) == "EntityGroup":
+        ids |= {u32(c.id) for c in group_children(o)}
+    done = None
+    for m in [m for m, mem in compounds(doc).items() if ids & set(mem)]:
+        dissolve_compound(doc, m)
+        done = m
+    return done
+
+
+def _remove_from_blocks(doc: MapDocument, gone: set[int]) -> None:
+    for b in doc.uids("GridCellDataBlock"):
+        o = doc.obj(b)
+        objs = o.fields["Objects"]
+        if not any(u32(x.id) in gone for x in objs):
+            continue
+        n = u32(o.fields["NumberOfObjectsToActivate"])
+        o.fields["NumberOfObjectsToActivate"] = idb(n - sum(1 for x in objs[:n] if u32(x.id) in gone))
+        o.fields["Objects"] = [x for x in objs if u32(x.id) not in gone]
+        doc.touch(b)
 
 
 # ------------------------------------------------------------------ transform --
@@ -117,6 +213,7 @@ def set_matrix(doc: MapDocument, key, m: bytes) -> None:
     old = o.fields["GlobalMatrix"]
     if old == m:
         return
+    ensure_standalone(doc, key)
     o.fields["GlobalMatrix"] = m
     if child < 0 and type_name(o.type_hash) == "EntityGroup":
         # row-vector convention: world = local * M  ->  new_child = child * inv(old) * new
@@ -192,13 +289,27 @@ def clone_tree(doc: MapDocument, obj: Obj) -> Obj:
     return new
 
 
-def duplicate(doc: MapDocument, key, matrix: bytes | None = None) -> tuple[int, int]:
-    """Copy an element next to itself (same block/entry for a root, same group for a child). Returns its key."""
+def duplicate(doc: MapDocument, key, matrix: bytes | None = None, block: int | None = None) -> tuple[int, int]:
+    """Copy an element next to itself (same block/entry for a root, same group for a child), or into `block`'s entry
+    (a GridCellDataBlock uid; roots only). Returns its key."""
     uid, child = key
     src = element_obj(doc, key)
     new = clone_tree(doc, src)
     if matrix is not None:
         new.fields["GlobalMatrix"] = matrix
+    unmerge(new)    # a copy isn't in its source's compound: merged, it would have no collision
+    for c in group_children(new) if type_name(new.type_hash) == "EntityGroup" else ():
+        unmerge(c)
+    if block is not None and child < 0 and block != owning_block(doc, uid):
+        fn = doc.entry_of(block)
+        if doc.entry_root(fn) != block:
+            raise EditError(f"{doc.name_of(block)} doesn't own its entry")
+        src_root = doc.root(uid)
+        localize_links(doc, new, fn)
+        nuid = doc.add_root(fn, Root(src_root.pre_header, src_root.status, new), _copy_name(doc, uid))
+        copy_deps(doc, doc.entry_of(uid), fn, new)
+        activate(doc, block, [nuid])
+        return (nuid, -1)
     if child >= 0:
         g = doc.obj(uid)
         g.fields["Entities"].append(Ref(0, g.fields["Entities"][child].extra, new.id, new))
@@ -215,6 +326,99 @@ def duplicate(doc: MapDocument, key, matrix: bytes | None = None) -> tuple[int, 
         raise EditError("source root does not live in its block's entry")
     activate(doc, blk, [nuid])
     return (nuid, -1)
+
+
+def linked_ids(o: Obj) -> set[int]:
+    """Ids a tree links to (handles, unresolved refs and pointer links), excluding 0."""
+    out = set()
+    for x in walk(o):
+        for v in list(x.fields.values()) + [d[3] for d in x.dyn or []]:
+            for y in v if isinstance(v, list) else [v]:
+                if isinstance(y, Handle) or (isinstance(y, Ref) and y.obj is None):
+                    out.add(u32(y.id))
+                elif isinstance(y, Ptr) and y.obj is None and y.link is not None:
+                    out.add(u32(y.link))
+    out.discard(0)
+    return out
+
+
+def always_loaded_entries(doc: MapDocument) -> set[str]:
+    """Entries loaded whatever the player's position: the World's and the whole-map grid cell's."""
+    out = {doc.entry_of(w) for w in doc.uids("World")}
+    try:
+        out.add(doc.entry_of(top_block(doc)))
+    except EditError:
+        pass
+    return out
+
+
+def localize_links(doc: MapDocument, o: Obj, dst_fn: str) -> int:
+    """Make everything tree `o` (about to be stored in entry dst_fn, or touched by the caller) links to loadable
+    wherever dst_fn is. Entries load by id, but roots stored inside another entry (Materials and TextureSets live in
+    grid-cell entries, with no dependency from their users) exist only while that entry is loaded: each such root
+    not in dst_fn or an always-loaded entry is copied into dst_fn (fresh ids, once per entry) and the link
+    redirected. Returns the number of copies made."""
+    entries = {e.id & 0xFFFFFFFF for e in doc.entries}
+    ok = always_loaded_entries(doc) | {dst_fn}
+    memo = doc.__dict__.setdefault("_localized", {})
+    made = 0
+
+    def fix(t: Obj) -> None:
+        nonlocal made
+        mapping = {}
+        for i in linked_ids(t):
+            if i in entries or i not in doc.where or any(fn in ok for fn, _ in doc.where[i]):
+                continue
+            if (i, dst_fn) not in memo:
+                r = doc.root(i)
+                if r is None:
+                    continue    # opaque: can't renumber it
+                new = Root(r.pre_header, r.status, clone_tree(doc, r.obj))
+                memo[(i, dst_fn)] = u32(new.obj.id)
+                fix(new.obj)
+                doc.add_root(dst_fn, new, f"{doc.name_of(i)}_l{u32(new.obj.id) & 0xFFFF:04x}")
+                made += 1
+            mapping[i] = memo[(i, dst_fn)]
+        if mapping:
+            _remap_ids(t, mapping)
+
+    fix(o)
+    return made
+
+
+def _entry_ids_of(doc: MapDocument, ids) -> dict[int, str]:
+    """entry id -> entry file name, for the entries holding the given root ids."""
+    out = {}
+    for i in ids:
+        if i in doc.where:
+            fn = doc.where[i][0][0]
+            e = doc.entry_root(fn)
+            if e is not None:
+                out[e] = fn
+    return out
+
+
+def copy_deps(doc: MapDocument, src_fn: str, dst_fn: str, o: Obj) -> None:
+    """A root moved/copied from entry src_fn into dst_fn takes along the dependencies src_fn listed for what it links
+    to (retail tables list only part of what an entry references, so nothing is added that src_fn didn't have)."""
+    have = {d.id & 0xFFFFFFFF for d in doc._file(src_fn).deps}
+    for e, fn in _entry_ids_of(doc, linked_ids(o)).items():
+        if e in have and fn != dst_fn:
+            doc.add_dependency(dst_fn, e)
+
+
+def top_block(doc: MapDocument) -> int:
+    """The GridCellDataBlock of the grid's last cell, which covers the whole map and is always loaded (the level-0
+    cells stream in only within the LoadingRangeTable radius of the World's anchor)."""
+    best = None
+    for b in doc.uids("GridCellDataBlock"):
+        n = doc.name_of(b)
+        if n.startswith("Cell") and n.endswith("_DataBlock") and n[4:-10].isdigit():
+            if best is None or int(n[4:-10]) > best[0]:
+                best = (int(n[4:-10]), b)
+    if best is None:
+        raise EditError("no grid cell blocks in this map")
+    return best[1]
 
 
 def _copy_name(doc: MapDocument, uid: int) -> str:
@@ -271,26 +475,109 @@ def delete(doc: MapDocument, key, force: bool = False) -> None:
     target = element_obj(doc, key)
     ids = {u32(o.id) for o in walk(target)} - {0}
     blocks = {b for b in doc.uids("GridCellDataBlock")}
-    refs = [h for h in references_to(doc, ids, skip={uid} | blocks) if not (child >= 0 and h[0] == uid)]
+    comps = {m for m, mem in compounds(doc).items() if ids & set(mem)}
+    refs = [h for h in references_to(doc, ids, skip={uid} | blocks | comps) if not (child >= 0 and h[0] == uid)]
     if refs and not force:
         raise EditError(f"still referenced by {len(refs)} object(s): " +
                         ", ".join(f"{doc.name_of(u)} ({f})" for u, f in refs[:5]))
+    for m in comps:
+        dissolve_compound(doc, m)
     if child >= 0:
         g = doc.obj(uid)
         del g.fields["Entities"][child]
         doc.touch(uid)
         return
-    for b in blocks:
-        o = doc.obj(b)
-        objs = o.fields["Objects"]
-        n = u32(o.fields["NumberOfObjectsToActivate"])
-        keep = [x for x in objs if u32(x.id) != uid]
-        if len(keep) != len(objs):
-            removed_active = sum(1 for x in objs[:n] if u32(x.id) == uid)
-            o.fields["Objects"] = keep
-            o.fields["NumberOfObjectsToActivate"] = idb(n - removed_active)
-            doc.touch(b)
+    _remove_from_blocks(doc, {uid})
     doc.remove_root(uid)
+
+
+SCENERY_KINDS = {"visual", "collision"}
+
+
+def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
+    """Start a new map from this one: remove every element of `kinds` (default: visible geometry and static
+    collision) and every group made only of them, keeping gameplay (spawns, chests, benches, chase breakers, zones,
+    out-of-bounds, crowd flows...). Elements something else still links to are kept. The removed roots' entries
+    lose the dependencies only they needed, and the World's FakeEntities (merged far-LOD stand-ins of the old
+    buildings, drawn for cells that aren't loaded) draw nothing. The navmesh is not touched.
+    Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped."""
+    from .kinds import classify, kind_of
+    roots = {}
+    for e in classify(doc, with_children=False):
+        if e.kind in kinds:
+            roots[e.uid] = e
+        elif e.kind == "group":
+            ch = group_children(e.obj)
+            if ch and all(kind_of(c) in kinds for c in ch):
+                roots[e.uid] = e
+    blocks = set(doc.uids("GridCellDataBlock"))
+    comps = compounds(doc)
+    # keep whatever something outside the removal set (and the compounds, handled below) links to
+    sub_owner = {}
+    for u in roots:
+        for o in walk(doc.obj(u)):
+            sub_owner[u32(o.id)] = u
+    sub_owner.pop(0, None)
+    kept = {u for u, _f in references_to(doc, set(sub_owner), skip=set(roots) | blocks | set(comps))}
+    keep_roots = set()
+    for u in kept:
+        r = doc.root(u)
+        for i in linked_ids(r.obj) if r is not None else ():
+            if i in sub_owner:
+                keep_roots.add(sub_owner[i])
+    gone = set(roots) - keep_roots
+    # compounds: one whose members all go goes too; one that keeps some (benches...) is dissolved
+    member_root = {u32(e.obj.id): e.uid for e in classify(doc)}
+    dissolved = 0
+    for m, mem in list(comps.items()):
+        hit = [i for i in mem if member_root.get(i) in gone]
+        if not hit:
+            continue
+        if len(hit) == len(mem):
+            comps.pop(m)
+            gone.add(m)
+        else:
+            dissolve_compound(doc, m, remove=False)
+            gone.add(m)
+            dissolved += 1
+
+    # dependency pruning: what the removed roots needed minus what the rest of their entries still use
+    by_entry: dict[str, set[int]] = {}
+    for u in gone:
+        by_entry.setdefault(doc.entry_of(u), set()).add(u)
+    dropped = 0
+    for fn, us in by_entry.items():
+        lost, still = set(), set()
+        for sub in doc._file(fn).subs:
+            v = DataFile.uid(sub[2])
+            r = doc.root(v)
+            if r is None:
+                continue
+            (lost if v in us else still).update(_entry_ids_of(doc, linked_ids(r.obj)))
+        drop = lost - still
+        df = doc._file(fn)
+        n = len(df.deps)
+        df.deps = [d for d in df.deps if (d.id & 0xFFFFFFFF) not in drop]
+        if len(df.deps) != n:
+            dropped += n - len(df.deps)
+            doc.touched_files.add(fn)
+
+    _remove_from_blocks(doc, gone)
+    doc.remove_roots(gone)
+
+    for f in doc.uids("FakeEntities"):
+        fo = doc.obj(f)
+        if fo is None:
+            continue
+        for fe in fo.fields["FakeEntities"]:
+            for sm in fe.fields["SubMeshSpans"]:
+                for sp in sm.fields["Spans"]:
+                    sp.fields["NbIndex"] = idb(0)
+        doc.touch(f)
+    if hasattr(doc, "_all_ids"):
+        doc._all_ids = None
+    return {"removed": len(gone), "kept_referenced": len(set(roots) - gone),
+            "compounds_dissolved": dissolved, "deps_dropped": dropped}
 
 
 # ------------------------------------------------------------------ collision --
@@ -314,6 +601,7 @@ def shape_users(doc: MapDocument, shape_uid: int) -> list[tuple[int, int]]:
 
 def make_shape_unique(doc: MapDocument, key, inert_index: int = 0) -> int:
     """Give one element its own copy of a shared MeshShape (stored in the element's entry). Returns the new uid."""
+    ensure_standalone(doc, key)
     o = element_obj(doc, key)
     _ci, ic = inert_components(o)[inert_index]
     ref = ic.fields["RigidBody"].fields["Shape"]
@@ -324,6 +612,7 @@ def make_shape_unique(doc: MapDocument, key, inert_index: int = 0) -> int:
     nid = fresh_ids(doc, 1)[0]
     new = copy.deepcopy(r)
     new.obj.id = idb(nid)
+    localize_links(doc, new.obj, doc.entry_of(key[0]))
     doc.add_root(doc.entry_of(key[0]), new, f"{doc.name_of(src)}_u{nid & 0xFFFF:04x}")
     ic.fields["RigidBody"].fields["Shape"] = Ref(ref.tag, ref.extra, idb(nid))
     doc.touch(key[0])
@@ -363,12 +652,14 @@ def collision_template(doc: MapDocument):
     return best[1]
 
 
-def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_key=None) -> tuple[int, int]:
+def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_key=None,
+                  block: int | None = None) -> tuple[int, int]:
     """A new static collision entity (no visual, no climb edges) with its own MeshShape, cloned from a plain collision
-    entity of the map and placed in the same grid cell block. Returns its key."""
+    entity of the map, in `block` (default: the always-loaded whole-map cell, so it exists wherever it is placed).
+    Returns its key."""
     from .geom import set_mesh_shape_geometry
     t = template_key or collision_template(doc).key
-    key = duplicate(doc, t, matrix)
+    key = duplicate(doc, t, matrix, block if block is not None else top_block(doc))
     o = element_obj(doc, key)
     o.fields["Components"] = [p for p in o.fields["Components"]
                               if not (isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) == "Visual")]
@@ -405,6 +696,7 @@ def set_visual(doc: MapDocument, key, mesh_input) -> int:
     o = element_obj(doc, key)
     root, mats = V.build_mesh(doc, mesh_input, lambda x: clone_tree(doc, x))
     fn = doc.entry_of(key[0])
+    localize_links(doc, root.obj, fn)   # the map materials it uses must load wherever this entry does
     mesh_uid = doc.add_root(fn, root, f"{doc.name_of(key[0])}_Mesh{u32(root.obj.id) & 0xFFFF:04x}")
 
     comp = clone_tree(doc, visual_template(doc))
@@ -428,6 +720,7 @@ def set_visual(doc: MapDocument, key, mesh_input) -> int:
         mi.fields["InstanceMaterial"] = Ref(r.tag, r.extra, idb(m))
         infos.append(mi)
     idata.fields["MaterialInfos"] = infos
+    localize_links(doc, comp, fn)
     status = next((p.status for p in o.fields["Components"] if isinstance(p, Ptr) and p.obj is not None), 4)
     o.fields["Components"] = [Ptr(status, None, comp)] + [
         p for p in o.fields["Components"]
@@ -449,10 +742,12 @@ def set_visual(doc: MapDocument, key, mesh_input) -> int:
     return mesh_uid
 
 
-def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None) -> tuple[int, int]:
-    """A new visual-only element (no collision, no climb edges) showing mesh_input. Returns its key."""
+def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None,
+                block: int | None = None) -> tuple[int, int]:
+    """A new visual-only element (no collision, no climb edges) showing mesh_input, in `block` (default: the
+    always-loaded whole-map cell). Returns its key."""
     t = template_key or collision_template(doc).key
-    key = duplicate(doc, t, matrix)
+    key = duplicate(doc, t, matrix, block if block is not None else top_block(doc))
     o = element_obj(doc, key)
     o.fields["Components"] = [p for p in o.fields["Components"]
                               if not (isinstance(p, Ptr) and p.obj is not None

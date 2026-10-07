@@ -26,10 +26,11 @@ from mathutils import Matrix, Quaternion, Vector
 
 from acbmap import guidance as G
 from acbmap import ops
+from acbmap import split as SP
 from acbmap import visual as V
 from acbmap.doc import MapDocument, u32
 from acbmap.geom import from_blender, mesh_shape_geometry, set_mesh_shape_geometry, to_blender
-from acbmap.kinds import classify, component, components, group_children
+from acbmap.kinds import Element, classify, component, components, group_children
 from acbmap.schema import type_name
 from acbmap.worlddata import WorldData
 
@@ -223,6 +224,8 @@ class Session:
         name = f"{coll} [{self.tag}]"
 
         def find(lc):
+            if lc is None:   # a scene that was never made active (background runs)
+                return None
             if lc.collection.name == name:
                 return lc
             for c in lc.children:
@@ -390,6 +393,81 @@ class Session:
             sm = slot_mat[min(lt.material_index, len(slot_mat) - 1)]
             tri_mat.append(mats.index(sm))
         return V.MeshInput(verts, normals, uvs, tris, tri_mat, mats)
+
+    @staticmethod
+    def collision_geometry(ob):
+        """A mesh object's triangles for a MeshShape: object-local with the object's scale baked in."""
+        import bmesh
+        bm = bmesh.new()
+        bm.from_mesh(ob.data)
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        bm.verts.index_update()
+        sc = ob.matrix_world.to_scale()
+        verts = [tuple(v.co[i] * sc[i] for i in range(3)) for v in bm.verts]
+        tris = [tuple(v.index for v in f.verts) for f in bm.faces]
+        bm.free()
+        return verts, tris
+
+    def import_mesh(self, ob, collision=True, visible=True, max_size=SP.MAX_SIZE):
+        """Turn a plain mesh object into new elements, split into game-sized pieces (acbmap.split), each centred on
+        its own origin and placed in the always-loaded cell. collision: static collision (MeshShape), visible: a
+        visual mesh. Returns the new element keys (climb edges are left to the caller, who can then build the
+        world collision once for all of them)."""
+        loc, rot, sc = ob.matrix_world.decompose()
+        base = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
+        mi = self.mesh_input(ob, Matrix.Diagonal((*sc, 1))) if visible else None
+        cv, ct = self.collision_geometry(ob) if collision else (None, None)
+        if mi is not None:
+            tree, leaves = SP.partition(mi.verts, mi.tris, mi.uvs, max_size=max_size)
+            col = SP.assign(tree, cv, ct) if collision else {}
+        else:
+            tree, leaves = SP.partition(cv, ct, max_size=max_size)
+            col = dict(enumerate(leaves))
+        keys = []
+        for li, leaf in enumerate(leaves):
+            vis = leaf if mi is not None else None
+            cidx = col.get(li, [])
+            c = SP.center(mi.verts, mi.tris, vis) if vis else SP.center(cv, ct, cidx)
+            m = from_blender(base @ Matrix.Translation(c))
+            if cidx:
+                v, t, mm = SP.sub_collision(cv, ct, [0] * len(ct), cidx, c)
+                if len(v) > 0xFFFF:
+                    raise ValueError(f"{ob.name}: a piece has {len(v)} collision vertices (at most 65535)")
+                nk = ops.new_collision(self.doc, m, v, t, mm)
+                if vis:
+                    ops.set_visual(self.doc, nk, SP.sub_mesh_input(mi, vis, c))
+            elif vis:
+                nk = ops.new_scenery(self.doc, m, SP.sub_mesh_input(mi, vis, c))
+            else:
+                continue
+            keys.append(nk)
+        return keys
+
+    def show_new_element(self, key, name: str):
+        """The Blender object of an element created in the document."""
+        o = ops.element_obj(self.doc, key)
+        names = [n for n, _ in components(o)]
+        kind = "collision" if "InertComponent" in names else "visual"
+        e = Element(kind, key[0], o, key[1], names, ops.owning_block(self.doc, key[0]))
+        return self._element_object(e, name)   # named at creation: the session maps keys to object names
+
+    def clear_scenery(self) -> dict:
+        """ops.clear_scenery, then drop the Blender objects of what it removed."""
+        self.sync()
+        res = ops.clear_scenery(self.doc)
+        gone = [k for k in self.objects if parse_key(k.split("|")[0])[0] not in self.doc.info]
+        for k in gone:
+            ob = bpy.data.objects.get(self.objects.pop(k))
+            self.baseline.pop(k, None)
+            if ob is not None:
+                for ch in list(ob.children_recursive):
+                    bpy.data.objects.remove(ch)
+                bpy.data.objects.remove(ob)
+        for me in [m for m in bpy.data.meshes if m.users == 0 and ("acb_shape" in m or m.name.startswith("ACB"))]:
+            bpy.data.meshes.remove(me)
+        self.snapshot()
+        res["blender_objects"] = len(gone)
+        return res
 
     def replace_element_visual(self, key):
         """Show an element's (new) visual mesh on its Blender object."""
@@ -848,6 +926,8 @@ class Session:
         tris = [tuple(v.index for v in f.verts) for f in bm.faces]
         mats = [f.material_index for f in bm.faces]
         bm.free()
+        for k in ops.shape_users(self.doc, sid):   # compound members collide through the compound's stale MOPP
+            ops.ensure_standalone(self.doc, k)
         o = self.doc.obj(sid)
         n_mat = len(o.fields["Materials"])
         mats = [min(m, max(n_mat - 1, 0)) for m in mats]

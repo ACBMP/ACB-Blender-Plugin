@@ -256,86 +256,88 @@ class ACB_OT_add_element(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _import_meshes(op, context, collision: bool, visible: bool):
+    """Shared body of Mesh to Collision / Mesh to Scenery: split pieces, then one climb-edge pass."""
+    s = sess(context)
+    s.sync()
+    made = []   # (key, blender name)
+    for ob in [o for o in context.selected_objects if o.type == "MESH" and "acb_key" not in o]:
+        try:
+            keys = s.import_mesh(ob, collision=collision, visible=visible, max_size=op.max_size)
+        except (ops.EditError, ValueError) as ex:
+            op.report({"ERROR"}, f"{ob.name}: {ex}")
+            continue
+        base = ob.name
+        bpy.data.objects.remove(ob)
+        suffix = "_col" if collision else "_vis"
+        made += [(k, base + suffix if len(keys) == 1 else f"{base}{suffix}{i:03d}") for i, k in enumerate(keys)]
+    edges = 0
+    if collision and getattr(op, "climb", False) and made:
+        world = s.world_collision()   # once, with every new piece in it
+        for k, _n in made:
+            try:
+                edges += G.regenerate(s.doc, k, ops.fresh_ids, world=world)
+            except ValueError as ex:
+                op.report({"WARNING"}, f"no climb edges: {ex}")
+    for k, name in made:
+        s.show_new_element(k, name)
+    s.snapshot()
+    return made, edges
+
+
 class ACB_OT_new_collision(bpy.types.Operator):
     """Turn the selected plain mesh objects into ACB static collision, visible in game (map materials on slots that
-    use them, ACBMat_*), with generated climb edges"""
+    use them, ACBMat_*), with generated climb edges. Big meshes are split into pieces"""
     bl_idname = "acb.new_collision"
     bl_label = "Mesh to Collision"
     bl_options = {"REGISTER", "UNDO"}
     climb: bpy.props.BoolProperty(name="Climb edges", default=True, description="Generate ledges from the mesh")
     visible: bpy.props.BoolProperty(name="Visible mesh", default=True,
                                     description="Also write the mesh as the object's visible geometry")
+    max_size: bpy.props.FloatProperty(name="Max piece size", default=64.0, min=4.0, max=1000.0, unit="LENGTH",
+                                      description="Meshes larger than this (or over 20000 triangles, or a 15-tile "
+                                                  "uv span) are split into pieces of at most this size")
 
     def execute(self, context):
-        import bmesh
-        s = sess(context)
-        s.sync()
-        done = 0
-        for ob in [o for o in context.selected_objects if o.type == "MESH" and "acb_key" not in o]:
-            bm = bmesh.new()
-            bm.from_mesh(ob.data)
-            bmesh.ops.triangulate(bm, faces=bm.faces[:])
-            bm.verts.index_update()
-            sc = ob.matrix_world.to_scale()
-            verts = [tuple(v.co[i] * sc[i] for i in range(3)) for v in bm.verts]   # scale baked into the shape
-            tris = [tuple(v.index for v in f.verts) for f in bm.faces]
-            bm.free()
-            if len(verts) > 0xFFFF:
-                self.report({"ERROR"}, f"{ob.name}: {len(verts)} vertices, a shape holds at most 65535 -- split it")
-                continue
-            loc, rot, _ = ob.matrix_world.decompose()
-            m = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
-            try:
-                nk = ops.new_collision(s.doc, from_blender(m), verts, tris, [0] * len(tris))
-            except ops.EditError as ex:
-                self.report({"ERROR"}, str(ex))
-                return {"CANCELLED"}
-            if self.climb:
-                try:
-                    G.regenerate(s.doc, nk, ops.fresh_ids, world=s.world_collision())
-                except ValueError as ex:
-                    self.report({"WARNING"}, f"no climb edges: {ex}")
-            if self.visible:
-                try:
-                    ops.set_visual(s.doc, nk, s.mesh_input(ob, Matrix.Diagonal((*sc, 1))))
-                except (ops.EditError, ValueError) as ex:
-                    self.report({"WARNING"}, f"{ob.name}: no visible mesh: {ex}")
-            o = ops.element_obj(s.doc, nk)
-            e = Element("collision", nk[0], o, -1, [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
-            s._element_object(e, ob.name + "_col")   # named at creation: the session maps keys to object names
-            bpy.data.objects.remove(ob)
-            done += 1
-        s.snapshot()
-        self.report({"INFO"}, f"{done} collision object(s) created")
+        made, edges = _import_meshes(self, context, True, self.visible)
+        self.report({"INFO"}, f"{len(made)} collision object(s) created, {edges} climb edges")
         return {"FINISHED"}
 
 
 class ACB_OT_new_scenery(bpy.types.Operator):
     """Turn the selected plain mesh objects into visible scenery without collision (map materials on slots that use
-    them, ACBMat_*)"""
+    them, ACBMat_*). Big meshes are split into pieces"""
     bl_idname = "acb.new_scenery"
     bl_label = "Mesh to Scenery"
     bl_options = {"REGISTER", "UNDO"}
+    max_size: bpy.props.FloatProperty(name="Max piece size", default=64.0, min=4.0, max=1000.0, unit="LENGTH")
+
+    def execute(self, context):
+        made, _ = _import_meshes(self, context, False, True)
+        self.report({"INFO"}, f"{len(made)} scenery object(s) created")
+        return {"FINISHED"}
+
+
+class ACB_OT_clear_scenery(bpy.types.Operator):
+    """Start a new map from this one: remove every visible mesh and static collision element, keeping spawns,
+    chests, interactive objects, zones and out-of-bounds. Then import your geometry (File > Import) and use Mesh to
+    Collision. NPCs keep walking the old navmesh"""
+    bl_idname = "acb.clear_scenery"
+    bl_label = "Clear Scenery"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         s = sess(context)
-        s.sync()
-        done = 0
-        for ob in [o for o in context.selected_objects if o.type == "MESH" and "acb_key" not in o]:
-            loc, rot, sc = ob.matrix_world.decompose()
-            m = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
-            try:
-                nk = ops.new_scenery(s.doc, from_blender(m), s.mesh_input(ob, Matrix.Diagonal((*sc, 1))))
-            except (ops.EditError, ValueError) as ex:
-                self.report({"ERROR"}, f"{ob.name}: {ex}")
-                continue
-            o = ops.element_obj(s.doc, nk)
-            e = Element("visual", nk[0], o, -1, [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
-            s._element_object(e, ob.name + "_vis")
-            bpy.data.objects.remove(ob)
-            done += 1
-        s.snapshot()
-        self.report({"INFO"}, f"{done} scenery object(s) created")
+        context.window.cursor_set("WAIT")
+        try:
+            r = s.clear_scenery()
+        finally:
+            context.window.cursor_set("DEFAULT")
+        self.report({"INFO"}, f"removed {r['removed']} objects ({r['compounds_dissolved']} merged-collision groups "
+                              f"split up); {r['kept_referenced']} kept because something links to them")
         return {"FINISHED"}
 
 
@@ -700,6 +702,7 @@ class ACB_PT_tools(ACBPanel, bpy.types.Panel):
         vis = s.collision_visible() if (s := sess(context)) is not None else True
         col.operator("acb.toggle_collision", text="Hide Collision" if vis else "Show Collision",
                      icon="HIDE_OFF" if vis else "HIDE_ON")
+        col.operator("acb.clear_scenery", icon="TRASH")
         col.operator("acb.new_collision", icon="MESH_CUBE")
         col.operator("acb.new_scenery", icon="SCENE_DATA")
         col.operator("acb.replace_visual", icon="MOD_MESHDEFORM")
@@ -795,7 +798,7 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
 
 
 CLASSES = (ACB_OT_open_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
-           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
+           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
            ACB_OT_strip_guidance,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_add_selected, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,

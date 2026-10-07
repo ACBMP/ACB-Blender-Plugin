@@ -116,3 +116,31 @@ def test_delete_refuses_referenced(tmp_path):
     w.set_vip_paths(w.vip_paths())      # the override entry now references the flow entity
     with pytest.raises(ops.EditError):
         ops.delete(d, (flow, -1))
+
+
+def test_compound_member_move_dissolves(tmp_path):
+    d = MapDocument(MAP)
+    comps = ops.compounds(d)
+    if not comps:
+        pytest.skip("no compound collision on this map")
+    m, members = next(iter(comps.items()))
+    idx = ops._sub_index(d)
+    key = idx[members[0]]
+    o = ops.element_obj(d, key)
+    mm = bytearray(o.fields["GlobalMatrix"])
+    mm[48:52] = (int.from_bytes(mm[48:52], "little") ^ 1).to_bytes(4, "little")
+    ops.set_matrix(d, key, bytes(mm))
+    d2 = reopen(d, tmp_path)
+    assert m not in d2.info
+    from acbmap.checks import check_compounds
+    assert check_compounds(d2) == []
+
+
+def test_clear_scenery(tmp_path):
+    d = MapDocument(MAP)
+    spawns = count(d, "spawn")
+    r = ops.clear_scenery(d)
+    d2 = reopen(d, tmp_path)
+    assert r["removed"] > 100 and count(d2, "collision") == 0 and count(d2, "spawn") == spawns
+    from acbmap.checks import new_problems
+    assert new_problems(d2, MapDocument(MAP)) == []

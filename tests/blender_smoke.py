@@ -100,6 +100,13 @@ scn.select_set(True)
 bpy.context.view_layer.objects.active = scn
 res_rep = bpy.ops.acb.replace_visual()
 print("SMOKE visual ops", res_col, res_scn, res_rep, vis_col and vis_col.type, scn.data.name)
+# a big imported surface: 150 m, ~80k triangles -> split into pieces
+grid = plain(bpy.ops.mesh.primitive_grid_add, base + Vector((0, 0, 30)), x_subdivisions=200, y_subdivisions=200,
+             size=150)
+grid_name, grid_tris = grid.name, 2 * len(grid.data.polygons)
+res_big = bpy.ops.acb.new_collision(climb=False)
+pieces = [o for o in bpy.context.scene.objects if o.name.startswith(grid_name + "_col") and "acb_key" in o]
+print("SMOKE big import", res_big, len(pieces), "pieces")
 col_key, scn_key = vis_col["acb_key"], scn["acb_key"]
 climb_drawn = bpy.data.objects.get(f"{climb_el.name}:climb")
 print("SMOKE generate_climb", res, "drawn", climb_drawn is not None)
@@ -140,9 +147,39 @@ from acbmap import visual as Vis
 gc = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(col_key)))[0])
 gs = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(scn_key)))[0])
 check(res_col == res_scn == res_rep == {"FINISHED"}, "mesh to collision / scenery / replace visual ran")
-check(gc is not None and len(gc.tris) == 12 and gc.materials == [int(acb_mat["acb_vis_material"], 16)],
-      "visible collision cube written with the chosen map material")
+chosen = int(acb_mat["acb_vis_material"], 16)
+check(gc is not None and len(gc.tris) == 12 and len(gc.materials) == 1
+      and (gc.materials[0] == chosen or d.name_of(gc.materials[0]).startswith(d.name_of(chosen) + "_l")),
+      "visible collision cube written with the chosen map material (or its always-loaded copy)")
+top = O.top_block(d)
+big = [S.parse_key(o["acb_key"]) for o in pieces]
+check(res_big == {"FINISHED"} and len(big) >= 9 and all(O.owning_block(d, k[0]) == top for k in big),
+      f"big mesh split into {len(big)} pieces, all in the always-loaded cell")
+def shape_tris(k):
+    ic = O.inert_components(O.element_obj(d, k))[0][1]
+    return len(mesh_shape_geometry(d.obj(int.from_bytes(ic.fields["RigidBody"].fields["Shape"].id, "little")))[1])
+n_big = sum(shape_tris(k) for k in big)
+check(n_big == grid_tris, f"pieces hold every collision triangle ({n_big} of {grid_tris})")
+check(all(ic.fields["IsMerged"] == b"\x00" for k in big + [S.parse_key(col_key)]
+          for _i, ic in O.inert_components(O.element_obj(d, k))), "new collision is not merged")
 check(gs is not None and len(gs.tris) > 12 and max(v[2] for v in gs.verts) > 1.4, "scenery visual replaced by cylinder")
 check(not O.inert_components(O.element_obj(d, S.parse_key(scn_key))), "scenery has no collision")
 check(not probs, "no new structural problems")
+
+# a new map from this one: clear the scenery (fresh scene, collision-only view for speed)
+sc2 = bpy.data.scenes.new("clear")
+s2 = S.Session(sc2, forge)
+s2.build(with_visuals=False)
+n_before = {k: sum(1 for e in classify(s2.doc, False) if e.kind == k) for k in ("spawn", "chest_spawn", "bench")}
+r = s2.clear_scenery()
+out2 = os.path.join(os.path.dirname(s.doc.cache), "edited", "smoke_clear_" + os.path.basename(forge))
+probs2 = s2.save(out2)
+d2 = MapDocument(out2)
+els2 = classify(d2, False)
+print("SMOKE clear", r, "problems", probs2)
+check(r["removed"] > 100 and not any(e.kind == "collision" for e in els2) and not O.compounds(d2),
+      "clear scenery removed the collision and every compound")
+check({k: sum(1 for e in els2 if e.kind == k) for k in n_before} == n_before, f"gameplay kept {n_before}")
+check(not [o for o in sc2.objects if o.get("acb_kind") == "collision"], "Blender collision objects removed")
+check(not probs2, "no new structural problems after clearing")
 print("SMOKE RESULT", "PASS" if ok else "FAIL")

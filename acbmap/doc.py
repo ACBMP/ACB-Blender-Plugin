@@ -217,6 +217,22 @@ class MapDocument:
         self._roots.pop(uid, None)
         self.dirty.discard(uid)
 
+    def remove_roots(self, uids) -> None:
+        """remove_root for many at once (one reindex per entry)."""
+        uids = set(uids)
+        files = {fn for u in uids for fn, _i in self.where.get(u, [])}
+        for fn in files:
+            df = self._file(fn)
+            df.subs = [s for s in df.subs if DataFile.uid(s[2]) not in uids]
+            self.touched_files.add(fn)
+        for u in uids:
+            self.where.pop(u, None)
+            self.info.pop(u, None)
+            self._roots.pop(u, None)
+            self.dirty.discard(u)
+        for fn in files:
+            self._reindex_file(fn)
+
     def _reindex_file(self, fname: str) -> None:
         for uid, locs in self.where.items():
             if any(fn == fname for fn, _ in locs):

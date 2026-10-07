@@ -118,9 +118,30 @@ def check_mesh_shapes(doc: MapDocument) -> list[str]:
     return out
 
 
+def check_compounds(doc: MapDocument) -> list[str]:
+    """Compound collision (ops.compounds): every member exists, and every InertComponent with IsMerged=1 belongs to a
+    compound -- a merged one outside any never adds its rigid body, so it has no collision in game."""
+    from .ops import compounds, inert_components
+    comps = compounds(doc)
+    members = {i for mem in comps.values() for i in mem}
+    out = []
+    ents = {}
+    for e in classify(doc):
+        ents[u32(e.obj.id)] = e
+        if u32(e.obj.id) not in members and any(ic.fields.get("IsMerged", b"\x00") != b"\x00"
+                                                 for _i, ic in inert_components(e.obj)):
+            out.append(f"merge: {doc.name_of(e.uid)}{'' if e.child < 0 else f'[{e.child}]'} has IsMerged=1 but no "
+                       "compound holds it (no collision in game)")
+    for m, mem in comps.items():
+        missing = [i for i in mem if i not in ents]
+        if missing:
+            out.append(f"merge: compound {doc.name_of(m)} lists {len(missing)} missing member(s), e.g. {missing[0]:#x}")
+    return out
+
+
 def run_all(doc: MapDocument) -> list[str]:
     return (check_alignment(doc.path) + check_blocks(doc) + check_spawns(doc) + check_deps(doc)
-            + check_editor_ids(doc) + check_mesh_shapes(doc))
+            + check_editor_ids(doc) + check_mesh_shapes(doc) + check_compounds(doc))
 
 
 def summary(problems: list[str]) -> Counter:
