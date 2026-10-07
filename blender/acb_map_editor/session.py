@@ -245,7 +245,7 @@ class Session:
             stack += list(c.children)
         return True
 
-    def _element_object(self, e):
+    def _element_object(self, e, name: str | None = None):
         k = keystr(e.key)
         shapes = [(i, ic) for i, ic in ops.inert_components(e.obj)]
         if not getattr(self, "with_collision", True):
@@ -257,7 +257,8 @@ class Session:
         if visuals and coll_name == "Collision":
             coll_name = "Scenery"   # the Collision collection gets hidden; the scenery itself must stay visible
         coll = self.coll(coll_name)
-        name = self.doc.name_of(e.uid) if e.child < 0 else f"{self.doc.name_of(e.uid)}/{e.child}"
+        if name is None:
+            name = self.doc.name_of(e.uid) if e.child < 0 else f"{self.doc.name_of(e.uid)}/{e.child}"
         mw = Matrix(to_blender(e.obj.fields["GlobalMatrix"]))
         wire_visuals = []
         if e.kind in WIRE_VISUAL_KINDS:
@@ -341,6 +342,64 @@ class Session:
         me["acb_shape"] = f"{sid:08x}"
         self.mesh_base[me.name] = mesh_hash(me)
         return me
+
+    def default_material(self) -> int:
+        if getattr(self, "_default_mat", None) is None:
+            self._default_mat = V.default_material(self.doc)
+        return self._default_mat
+
+    def mesh_input(self, ob, to_entity: Matrix) -> "V.MeshInput":
+        """A Blender mesh object as encoder input in an entity's frame (to_entity: object-local -> entity-local).
+        Slots holding one of the map's materials (ACBMat_*) keep it; others get the map's most used textured
+        material. Without a UV map, faces get box-projected uvs (one tile per 2 m)."""
+        me = ob.data
+        me.calc_loop_triangles()
+        nmat = to_entity.to_3x3().inverted().transposed()
+        corner = me.corner_normals if hasattr(me, "corner_normals") else None
+        uvl = me.uv_layers.active
+        slot_mat = []
+        for slot in ob.material_slots:
+            m = slot.material
+            slot_mat.append(int(m["acb_vis_material"], 16) if m is not None and "acb_vis_material" in m
+                            else self.default_material())
+        if not slot_mat:
+            slot_mat = [self.default_material()]
+        mats = list(dict.fromkeys(slot_mat))
+        index: dict[tuple, int] = {}
+        verts, normals, uvs, tris, tri_mat = [], [], [], [], []
+        for lt in me.loop_triangles:
+            fn = (nmat @ lt.normal).normalized()
+            axis = max(range(3), key=lambda k: abs(fn[k]))
+            tri = []
+            for li, vi in zip(lt.loops, lt.vertices):
+                p = to_entity @ me.vertices[vi].co
+                n = (nmat @ (corner[li].vector if corner is not None else me.loops[li].normal)).normalized()
+                if uvl is not None:
+                    uv = tuple(uvl.data[li].uv)
+                else:
+                    a, b = [k for k in range(3) if k != axis]
+                    uv = (p[a] / 2.0, p[b] / 2.0)
+                k = (vi, round(uv[0], 5), round(uv[1], 5), round(n.x, 3), round(n.y, 3), round(n.z, 3))
+                if k not in index:
+                    index[k] = len(verts)
+                    verts.append(tuple(p))
+                    normals.append(tuple(n))
+                    uvs.append(uv)
+                tri.append(index[k])
+            tris.append(tuple(tri))
+            sm = slot_mat[min(lt.material_index, len(slot_mat) - 1)]
+            tri_mat.append(mats.index(sm))
+        return V.MeshInput(verts, normals, uvs, tris, tri_mat, mats)
+
+    def replace_element_visual(self, key):
+        """Show an element's (new) visual mesh on its Blender object."""
+        ob = bpy.data.objects.get(self.objects.get(keystr(key), ""))
+        o = ops.element_obj(self.doc, key)
+        meshes = [m for m in (self._visual_mesh(u) for u in V.entity_meshes(self.doc, o)) if m is not None]
+        if ob is not None and ob.type == "MESH" and meshes and "acb_shape" not in ob.data:
+            ob.data = meshes[0]
+            return ob
+        return None
 
     def world_collision(self):
         """The map's collision in world space as the document has it now (built per call: edits move things)."""

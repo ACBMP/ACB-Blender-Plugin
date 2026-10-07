@@ -379,3 +379,83 @@ def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_k
     doc.touch(sid)
     doc.touch(key[0])
     return key
+
+
+# ------------------------------------------------------------------ visual meshes --
+
+def visual_template(doc: MapDocument) -> Obj:
+    """A retail Visual component that shows a Mesh directly (InstanceData = MeshInstanceData), to clone."""
+    from .kinds import classify, components
+    for e in classify(doc):
+        for n, c in components(e.obj):
+            if n != "Visual":
+                continue
+            idata = c.fields.get("InstanceData")
+            if (isinstance(idata, Ptr) and idata.obj is not None and type_name(idata.obj.type_hash) == "MeshInstanceData"
+                    and idata.obj.fields["MaterialInfos"]):
+                return c
+    raise EditError("no Visual with a direct mesh in this map to use as a template")
+
+
+def set_visual(doc: MapDocument, key, mesh_input) -> int:
+    """Give an element a visual mesh built from mesh_input (acbmap.visual.MeshInput, entity-local), replacing the
+    Visual components it had. The new Mesh root goes into the element's entry. Returns the Mesh uid."""
+    import struct
+    from . import visual as V
+    o = element_obj(doc, key)
+    root, mats = V.build_mesh(doc, mesh_input, lambda x: clone_tree(doc, x))
+    fn = doc.entry_of(key[0])
+    mesh_uid = doc.add_root(fn, root, f"{doc.name_of(key[0])}_Mesh{u32(root.obj.id) & 0xFFFF:04x}")
+
+    comp = clone_tree(doc, visual_template(doc))
+    tag, extra = comp.fields["Object"].tag, comp.fields["Object"].extra
+    comp.fields["Object"] = Ref(tag, extra, idb(mesh_uid))
+    idata = comp.fields["InstanceData"].obj
+    idata.fields["Mesh"] = Ptr(1, idb(mesh_uid))
+    cmi = getattr(idata.fields.get("CompiledMeshInstance"), "obj", None)
+    if cmi is not None:   # no baked ambient occlusion: retail instances without it carry an empty buffer
+        cmi.fields["HasAmbientOcclusion"] = b"\x00"
+        cmi.fields["VertexBuffer"] = []
+        cmi.fields["VertexFormat"] = b"\x00"
+        cmi.fields["MeshHash"] = bytes(len(cmi.fields["MeshHash"]))
+    proto = idata.fields["MaterialInfos"][0]
+    infos = []
+    for m in mats:
+        mi = copy.deepcopy(proto)
+        mi.fields["GraphicObjectInstance"] = Ptr(2, idata.id)
+        mi.fields["MeshMaterial"] = Handle(0, idb(m))
+        r = mi.fields["InstanceMaterial"]
+        mi.fields["InstanceMaterial"] = Ref(r.tag, r.extra, idb(m))
+        infos.append(mi)
+    idata.fields["MaterialInfos"] = infos
+    status = next((p.status for p in o.fields["Components"] if isinstance(p, Ptr) and p.obj is not None), 4)
+    o.fields["Components"] = [Ptr(status, None, comp)] + [
+        p for p in o.fields["Components"]
+        if not (isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) == "Visual")]
+
+    # culling bounds (entity-local): the new mesh together with the collision
+    pts = list(mesh_input.verts)
+    from .geom import mesh_shape_geometry
+    for _i, ic in inert_components(o):
+        sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
+        if sid in doc.info and doc.type_of(sid) == "MeshShape":
+            pts += mesh_shape_geometry(doc.obj(sid))[0]
+    bv = o.fields.get("BoundingVolume")
+    if bv is not None and pts:
+        bv.fields["Min"] = struct.pack("<3f", *(min(p[k] for p in pts) for k in range(3)))
+        bv.fields["Max"] = struct.pack("<3f", *(max(p[k] for p in pts) for k in range(3)))
+        bv.fields["Type"] = (0).to_bytes(4, "little")
+    doc.touch(key[0])
+    return mesh_uid
+
+
+def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None) -> tuple[int, int]:
+    """A new visual-only element (no collision, no climb edges) showing mesh_input. Returns its key."""
+    t = template_key or collision_template(doc).key
+    key = duplicate(doc, t, matrix)
+    o = element_obj(doc, key)
+    o.fields["Components"] = [p for p in o.fields["Components"]
+                              if not (isinstance(p, Ptr) and p.obj is not None
+                                      and type_name(p.obj.type_hash) in ("InertComponent", "GuidanceSystem"))]
+    set_visual(doc, key, mesh_input)
+    return key

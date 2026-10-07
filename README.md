@@ -55,8 +55,12 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      its children. Scenery is selectable too: clicking a building selects its entity.
    - Collision meshes: **Show Collision** (they're hidden while visuals are shown), then use edit mode and assign
      faces to the collision material slots. Shapes are shared between objects as in the game; **Make Shape
-     Unique** splits one off. **Mesh to Collision** turns any plain mesh into new static collision, with climb
-     edges.
+     Unique** splits one off. **Mesh to Collision** turns any plain mesh into new static collision that is also
+     visible in game, with climb edges.
+   - Visible geometry: **Mesh to Scenery** turns a plain mesh into a visible object without collision; **Replace
+     Visual** (select a plain mesh, then the element) swaps an element's visible mesh. Material slots holding one of
+     the map's materials (`ACBMat_*`, in the material list once a map is open) keep it; other slots get the map's
+     most used textured material. A mesh without a UV map gets box-projected uvs.
    - Climb edges (ledges and swing poles): **Show Climb Edges** draws them. **Generate Climb Edges** rebuilds the
      selected elements' edges from their collision, leaving out ledges whose hanging space another object takes or
      that sit less than the minimum drop above any floor (adjust *Min ledge depth* / *Min wall drop* / *Use
@@ -99,9 +103,9 @@ acbmap install <forge> | uninstall <name> | status
 
 ## Known limits (milestone 1)
 
-- **Visual meshes are display-only.** Moving, copying or deleting an entity carries its visual along, but the meshes
-  themselves can't be edited, and new collision (Mesh to Collision) has no visible geometry in game. Skinned meshes
-  (elevators, crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Materials use the diffuse and
+- **Visual meshes** are replaced whole (Replace Visual), not edited in place, and written without baked ambient
+  occlusion or LODs (one mesh at every distance). At most 65535 vertices per mesh. Skinned meshes (elevators,
+  crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Materials use the diffuse and
   normal maps (visible in Material Preview / Rendered shading); specular maps are ignored, and materials without a
   diffuse texture (blend spots, decals, FX planes) show plain white.
 - **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle refs. NPCs ignore

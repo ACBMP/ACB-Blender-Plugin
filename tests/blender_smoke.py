@@ -2,7 +2,8 @@
 
 Drives the add-on the way a user would: open a map, move a spawn, Shift+D a spawn and a chest, delete a spawn,
 reshape a collision mesh and a trigger zone, move and Shift+D a piece of scenery (shown by its visual mesh), generate
-climb edges on an element, save; then reopens the saved forge headless and checks every edit."""
+climb edges on an element, turn plain meshes into visible collision and scenery and swap a visual, save; then
+reopens the saved forge headless and checks every edit."""
 import os
 import sys
 import time
@@ -11,6 +12,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(REPO, "blender"), REPO, os.path.join(REPO, "vendor", "anvilforge-py", "src")]
 
 import bpy  # noqa: E402
+from mathutils import Vector  # noqa: E402
 
 import acb_map_editor  # noqa: E402
 
@@ -74,6 +76,31 @@ climb_el.select_set(True)
 bpy.context.view_layer.objects.active = climb_el
 res = bpy.ops.acb.generate_climb()
 climb_key = climb_el["acb_key"]
+
+def plain(op, loc, **kw):
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    op(location=loc, **kw)
+    ob = bpy.context.active_object
+    ob.select_set(True)
+    return ob
+base = sp[0].matrix_world.translation
+acb_mat = next(m for m in bpy.data.materials if "acb_vis_material" in m)
+cube = plain(bpy.ops.mesh.primitive_cube_add, base + Vector((0, 0, 8)), size=2)
+cube.data.materials.append(acb_mat)
+cube_name = cube.name
+res_col = bpy.ops.acb.new_collision()
+vis_col = bpy.context.scene.objects.get(cube_name + "_col")
+cube2 = plain(bpy.ops.mesh.primitive_cube_add, base + Vector((4, 0, 8)), size=1)
+cube2_name = cube2.name
+res_scn = bpy.ops.acb.new_scenery()
+scn = bpy.context.scene.objects.get(cube2_name + "_vis")
+cyl = plain(bpy.ops.mesh.primitive_cylinder_add, scn.matrix_world.translation, radius=0.5, depth=3)
+scn.select_set(True)
+bpy.context.view_layer.objects.active = scn
+res_rep = bpy.ops.acb.replace_visual()
+print("SMOKE visual ops", res_col, res_scn, res_rep, vis_col and vis_col.type, scn.data.name)
+col_key, scn_key = vis_col["acb_key"], scn["acb_key"]
 climb_drawn = bpy.data.objects.get(f"{climb_el.name}:climb")
 print("SMOKE generate_climb", res, "drawn", climb_drawn is not None)
 print("SMOKE log", log)
@@ -109,5 +136,13 @@ ce = G.systems(O.element_obj(d, S.parse_key(climb_key)))
 n_climb = sum(len(G.edges(g)) for g in ce)
 check(res == {"FINISHED"} and (n_climb == 0 or (climb_drawn is not None and len(climb_drawn.data.edges) == n_climb)),
       f"generated climb edges saved and drawn ({n_climb})")
+from acbmap import visual as Vis
+gc = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(col_key)))[0])
+gs = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(scn_key)))[0])
+check(res_col == res_scn == res_rep == {"FINISHED"}, "mesh to collision / scenery / replace visual ran")
+check(gc is not None and len(gc.tris) == 12 and gc.materials == [int(acb_mat["acb_vis_material"], 16)],
+      "visible collision cube written with the chosen map material")
+check(gs is not None and len(gs.tris) > 12 and max(v[2] for v in gs.verts) > 1.4, "scenery visual replaced by cylinder")
+check(not O.inert_components(O.element_obj(d, S.parse_key(scn_key))), "scenery has no collision")
 check(not probs, "no new structural problems")
 print("SMOKE RESULT", "PASS" if ok else "FAIL")

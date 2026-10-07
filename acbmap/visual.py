@@ -12,6 +12,9 @@ result matches each entity's collision MeshShape to within centimetres. Normal c
 agrees with the stored triangle winding. UV = short / 2048 with V pointing down (D3D). VertexFormat 0 (32 bytes) is
 skinned (crowd, characters) and isn't decoded.
 
+The fourth bytes of the normal and tangent vary per vertex in most meshes (baked data); meshes where they are
+constant mostly use 255, which is what the writer uses.
+
 Textures: CompiledTextureMap.Data is a plain mip chain (largest first), PixelFormat 0 = 32-bit uncompressed,
 2/3 = DXT1, 4 = DXT3, 5 = DXT5. TextureSet.Maps slot 0 is the diffuse map, 1 the normal map, 2 the specular map.
 
@@ -22,10 +25,12 @@ alpha and y in green (DXT5 copies y to blue, red is 255), with z = sqrt(1 - x^2 
 """
 from __future__ import annotations
 
+import copy
+import math
 import struct
 from dataclasses import dataclass, field
 
-from .doc import MapDocument, u32
+from .doc import MapDocument, idb, u32
 from .kinds import components
 
 POS_SCALE = 1.0 / (1 << 18)
@@ -197,3 +202,185 @@ def texture_dds(doc: MapDocument, tex_uid: int) -> bytes | None:
     header = struct.pack("<4s7I44x", b"DDS ", 124, flags, h, w, pitch, 0, mips) + pixfmt + \
         struct.pack("<5I", caps, 0, 0, 0, 0)
     return header + data[:need]
+
+
+# ------------------------------------------------------------------ write --
+
+@dataclass
+class MeshInput:
+    """Triangles to encode, one entry per vertex corner already split (a vertex has one normal and one uv)."""
+    verts: list[tuple[float, float, float]]
+    normals: list[tuple[float, float, float]]
+    uvs: list[tuple[float, float]]          # Blender convention (V up)
+    tris: list[tuple[int, int, int]]
+    tri_material: list[int]                 # index into materials
+    materials: list[int]                    # Material uids
+
+
+MAX_UV = 32767 / 2048
+
+
+def _tangents(mi: MeshInput):
+    """Per-vertex tangent (along +u) and the handedness sign to store in position w (see the module docstring)."""
+    n = len(mi.verts)
+    tan = [[0.0, 0.0, 0.0] for _ in range(n)]
+    bit = [[0.0, 0.0, 0.0] for _ in range(n)]
+    for a, b, c in mi.tris:
+        pa, pb, pc = mi.verts[a], mi.verts[b], mi.verts[c]
+        # D3D v (down the texture) = 1 - Blender v
+        ua, va = mi.uvs[a][0], 1 - mi.uvs[a][1]
+        ub, vb = mi.uvs[b][0], 1 - mi.uvs[b][1]
+        uc, vc = mi.uvs[c][0], 1 - mi.uvs[c][1]
+        e1 = [pb[k] - pa[k] for k in range(3)]
+        e2 = [pc[k] - pa[k] for k in range(3)]
+        d1u, d1v, d2u, d2v = ub - ua, vb - va, uc - ua, vc - va
+        det = d1u * d2v - d2u * d1v
+        if abs(det) < 1e-12:
+            continue
+        r = 1.0 / det
+        su = [(e1[k] * d2v - e2[k] * d1v) * r for k in range(3)]
+        sv = [(e2[k] * d1u - e1[k] * d2u) * r for k in range(3)]
+        for i in (a, b, c):
+            for k in range(3):
+                tan[i][k] += su[k]
+                bit[i][k] += sv[k]
+    out_t, out_s = [], []
+    for i in range(n):
+        nn = mi.normals[i]
+        t = tan[i]
+        d = sum(t[k] * nn[k] for k in range(3))
+        t = [t[k] - nn[k] * d for k in range(3)]                    # Gram-Schmidt against the normal
+        L = math.sqrt(sum(x * x for x in t))
+        if L < 1e-9:   # no usable uv gradient: any vector perpendicular to the normal
+            ref = (1.0, 0.0, 0.0) if abs(nn[0]) < 0.9 else (0.0, 1.0, 0.0)
+            t = [ref[1] * nn[2] - ref[2] * nn[1], ref[2] * nn[0] - ref[0] * nn[2], ref[0] * nn[1] - ref[1] * nn[0]]
+            L = math.sqrt(sum(x * x for x in t)) or 1.0
+        t = [x / L for x in t]
+        c = [nn[1] * t[2] - nn[2] * t[1], nn[2] * t[0] - nn[0] * t[2], nn[0] * t[1] - nn[1] * t[0]]
+        # bitangent = cross(N, T) * -sign(w) must follow +v (D3D): w negative when cross(N, T) already does
+        out_s.append(-1 if sum(c[k] * bit[i][k] for k in range(3)) >= 0 else 1)
+        out_t.append(t)
+    return out_t, out_s
+
+
+def _b(x: float) -> int:
+    return max(0, min(255, round((x + 1) * 127.5)))
+
+
+def encode_static(mi: MeshInput):
+    """Vertex format 4 buffers for mi: (vertex bytes, index bytes, primitives [(min index, vertex count, start
+    index, triangle count)] in material order, vertex order) -- vertices are regrouped so each material's range is
+    contiguous."""
+    if not mi.tris:
+        raise ValueError("no triangles")
+    by_mat: dict[int, list[int]] = {}
+    for ti, m in enumerate(mi.tri_material):
+        by_mat.setdefault(m, []).append(ti)
+    tan, sign = _tangents(mi)
+    extent = max(abs(c) for v in mi.verts for c in v)
+    w = 8 * max(1, math.ceil(extent + 1e-6))
+    if w > 32767:
+        raise ValueError("mesh is larger than 4 km")
+    scale = (1 << 18) / w
+    u_off = math.floor(min(u for u, _ in mi.uvs)) if mi.uvs else 0
+    v_off = math.floor(min(1 - v for _, v in mi.uvs)) if mi.uvs else 0
+    vb, ib, prims = bytearray(), [], []
+    for mat in range(len(mi.materials)):
+        tris = by_mat.get(mat, [])
+        if not tris:
+            continue
+        remap: dict[int, int] = {}
+        base = len(vb) // 20
+        start = len(ib)
+        for ti in tris:
+            for i in mi.tris[ti]:
+                if i not in remap:
+                    remap[i] = base + len(remap)
+                    x, y, z = (round(c * scale) for c in mi.verts[i])
+                    u = (mi.uvs[i][0] - u_off) * 2048
+                    v = ((1 - mi.uvs[i][1]) - v_off) * 2048
+                    if abs(u) > 32767 or abs(v) > 32767:
+                        raise ValueError(f"uv span over {MAX_UV:.0f} tiles")
+                    nn, t = mi.normals[i], tan[i]
+                    vb += struct.pack("<4h4B4B2h", x, y, z, w * sign[i], _b(nn[0]), _b(nn[1]), _b(nn[2]), 255,
+                                      _b(t[0]), _b(t[1]), _b(t[2]), 255, round(u), round(v))
+                ib.append(remap[i])
+        if base + len(remap) > 0xFFFF:
+            raise ValueError(f"{base + len(remap)} vertices: at most 65535 per mesh")
+        prims.append((mat, base, len(remap), start, len(tris)))
+    return bytes(vb), struct.pack(f"<{len(ib)}H", *ib), prims
+
+
+def static_mesh_template(doc: MapDocument) -> int:
+    """A retail static (VertexFormat 4) Mesh of this map to clone the field layout from."""
+    for u in doc.uids("Mesh"):
+        o = doc.obj(u)
+        cm = getattr(o.fields.get("CompiledMesh"), "obj", None) if o is not None else None
+        if cm is None or not cm.fields["InstancingData"]:
+            continue
+        md = cm.fields["MeshData"]
+        if (md.fields["VertexFormat"][0], md.fields["VertexStride"][0]) == (4, 20) and md.fields["StandardPrimitives"] \
+                and not o.fields["Bones"] and not o.fields["UseFakeMeshDrawPrimMasking"][0]:
+            return u
+    raise ValueError("no static mesh in this map to use as a template")
+
+
+def build_mesh(doc: MapDocument, mi: MeshInput, clone):
+    """A new Mesh root holding mi (not yet added to the document). clone(obj) deep-copies with fresh ids."""
+    tmpl = static_mesh_template(doc)
+    src = doc.root(tmpl)
+    o = clone(src.obj)
+    vb, ib, prims = encode_static(mi)
+    cm = o.fields["CompiledMesh"].obj
+    md = cm.fields["MeshData"]
+    proto_prim = md.fields["StandardPrimitives"][0]
+    proto_inst = cm.fields["InstancingData"][0]
+    md.fields["IsIndexBuffer32bit"] = b"\x00"
+    md.fields["VertexFormat"] = b"\x04"
+    md.fields["VertexStride"] = bytes([20])
+    std, shadow, inst = [], [], []
+    for k, (mat, base, nv, start, ntri) in enumerate(prims):
+        p = copy.deepcopy(proto_prim)
+        p.fields.update(MinIndex=base.to_bytes(4, "little"), NumVertices=nv.to_bytes(4, "little"),
+                        StartIndex=start.to_bytes(4, "little"), PrimitiveCount=ntri.to_bytes(4, "little"),
+                        Type=(1).to_bytes(4, "little"), IsUsingDepthOnlyBuffers=bytes(4))
+        std.append(p)
+        shadow.append(copy.deepcopy(p))
+        d = copy.deepcopy(proto_inst)
+        d.fields["ShadowCaster"] = b"\x01"
+        d.fields["NumBones"] = b"\x00"
+        d.fields["SubMeshIndex"] = bytes([k])
+        d.fields["NumVertices"] = nv.to_bytes(2, "little")
+        d.fields["Material"] = type(d.fields["Material"])(1, idb(mi.materials[mat]))
+        inst.append(d)
+    md.fields["StandardPrimitives"] = std
+    md.fields["ShadowPrimitives"] = shadow
+    md.fields["VertexBufferData"] = [bytes([b]) for b in vb]
+    md.fields["IndexBufferData"] = [bytes([b]) for b in ib]
+    for k in ("PS3DepthOnlyVertexData", "PS3DepthOnlyIndexData", "EdgeData", "NonEdgeData"):
+        md.fields[k] = []
+    cm.fields["InstancingData"] = inst
+    ref = o.fields["CompiledMeshMaterials"][0]
+    o.fields["CompiledMeshMaterials"] = [type(ref)(ref.tag, ref.extra, idb(mi.materials[m])) for m, *_ in prims]
+    o.fields["SubMeshes"] = []
+    o.fields["Bones"] = []
+    for k in ("FakeMeshGridIndex", "FakeMeshGridCount"):
+        o.fields[k] = bytes(len(o.fields[k]))
+    return type(src)(src.pre_header, src.status, o), [mi.materials[m] for m, *_ in prims]
+
+
+def default_material(doc: MapDocument) -> int:
+    """The map's most used static-mesh material that has a diffuse texture: the fallback for new meshes."""
+    import collections
+    c = collections.Counter()
+    for u in doc.uids("Mesh"):
+        o = doc.obj(u)
+        if o is None or o.fields["Bones"]:
+            continue
+        for r in o.fields["CompiledMeshMaterials"]:
+            if r.id and u32(r.id) in doc.info:
+                c[u32(r.id)] += 1
+    for m, _n in c.most_common():
+        if material_texture(doc, m, 0) is not None:
+            return m
+    raise ValueError("no textured material in this map")

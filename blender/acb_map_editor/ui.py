@@ -257,11 +257,14 @@ class ACB_OT_add_element(bpy.types.Operator):
 
 
 class ACB_OT_new_collision(bpy.types.Operator):
-    """Turn the selected plain mesh objects into ACB static collision (no visual mesh), with generated climb edges"""
+    """Turn the selected plain mesh objects into ACB static collision, visible in game (map materials on slots that
+    use them, ACBMat_*), with generated climb edges"""
     bl_idname = "acb.new_collision"
     bl_label = "Mesh to Collision"
     bl_options = {"REGISTER", "UNDO"}
     climb: bpy.props.BoolProperty(name="Climb edges", default=True, description="Generate ledges from the mesh")
+    visible: bpy.props.BoolProperty(name="Visible mesh", default=True,
+                                    description="Also write the mesh as the object's visible geometry")
 
     def execute(self, context):
         import bmesh
@@ -292,14 +295,77 @@ class ACB_OT_new_collision(bpy.types.Operator):
                     G.regenerate(s.doc, nk, ops.fresh_ids, world=s.world_collision())
                 except ValueError as ex:
                     self.report({"WARNING"}, f"no climb edges: {ex}")
+            if self.visible:
+                try:
+                    ops.set_visual(s.doc, nk, s.mesh_input(ob, Matrix.Diagonal((*sc, 1))))
+                except (ops.EditError, ValueError) as ex:
+                    self.report({"WARNING"}, f"{ob.name}: no visible mesh: {ex}")
             o = ops.element_obj(s.doc, nk)
             e = Element("collision", nk[0], o, -1, [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
-            new = s._element_object(e)
-            new.name = ob.name + "_col"
+            s._element_object(e, ob.name + "_col")   # named at creation: the session maps keys to object names
             bpy.data.objects.remove(ob)
             done += 1
         s.snapshot()
         self.report({"INFO"}, f"{done} collision object(s) created")
+        return {"FINISHED"}
+
+
+class ACB_OT_new_scenery(bpy.types.Operator):
+    """Turn the selected plain mesh objects into visible scenery without collision (map materials on slots that use
+    them, ACBMat_*)"""
+    bl_idname = "acb.new_scenery"
+    bl_label = "Mesh to Scenery"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = sess(context)
+        s.sync()
+        done = 0
+        for ob in [o for o in context.selected_objects if o.type == "MESH" and "acb_key" not in o]:
+            loc, rot, sc = ob.matrix_world.decompose()
+            m = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
+            try:
+                nk = ops.new_scenery(s.doc, from_blender(m), s.mesh_input(ob, Matrix.Diagonal((*sc, 1))))
+            except (ops.EditError, ValueError) as ex:
+                self.report({"ERROR"}, f"{ob.name}: {ex}")
+                continue
+            o = ops.element_obj(s.doc, nk)
+            e = Element("visual", nk[0], o, -1, [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
+            s._element_object(e, ob.name + "_vis")
+            bpy.data.objects.remove(ob)
+            done += 1
+        s.snapshot()
+        self.report({"INFO"}, f"{done} scenery object(s) created")
+        return {"FINISHED"}
+
+
+class ACB_OT_replace_visual(bpy.types.Operator):
+    """Make the selected plain mesh the visible geometry of the active ACB element (replacing its own; collision and
+    climb edges stay as they are). The plain mesh is consumed"""
+    bl_idname = "acb.replace_visual"
+    bl_label = "Replace Visual"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = sess(context)
+        target, key = active_element(context)
+        src = [o for o in context.selected_objects if o.type == "MESH" and "acb_key" not in o]
+        if target is None or len(src) != 1:
+            self.report({"ERROR"}, "select one plain mesh, then the ACB element (active)")
+            return {"CANCELLED"}
+        s.sync()
+        el = bpy.data.objects.get(s.objects.get(target["acb_key"], "")) or target
+        to_entity = el.matrix_world.inverted() @ src[0].matrix_world
+        try:
+            ops.set_visual(s.doc, key, s.mesh_input(src[0], to_entity))
+        except (ops.EditError, ValueError) as ex:
+            self.report({"ERROR"}, str(ex))
+            return {"CANCELLED"}
+        if s.replace_element_visual(key) is None:
+            self.report({"WARNING"}, "written; reopen the map to see it on this element")
+        bpy.data.objects.remove(src[0])
+        s.snapshot()
+        self.report({"INFO"}, f"{el.name}: new visual mesh")
         return {"FINISHED"}
 
 
@@ -635,6 +701,8 @@ class ACB_PT_tools(ACBPanel, bpy.types.Panel):
         col.operator("acb.toggle_collision", text="Hide Collision" if vis else "Show Collision",
                      icon="HIDE_OFF" if vis else "HIDE_ON")
         col.operator("acb.new_collision", icon="MESH_CUBE")
+        col.operator("acb.new_scenery", icon="SCENE_DATA")
+        col.operator("acb.replace_visual", icon="MOD_MESHDEFORM")
         col.operator("acb.make_unique", icon="DUPLICATE")
         col.separator()
         cv = s.collection_visible("Climb Edges") if s is not None else False
@@ -727,7 +795,7 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
 
 
 CLASSES = (ACB_OT_open_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
-           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
+           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
            ACB_OT_strip_guidance,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_add_selected, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,
