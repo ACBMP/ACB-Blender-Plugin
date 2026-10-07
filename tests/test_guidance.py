@@ -107,6 +107,7 @@ class StubWorld:
 
 def test_world_filter():
     import struct
+    pytest.importorskip("numpy")
     ident = struct.pack("<16f", 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
     el = G.generate(BOX_V, BOX_T)                     # ledges at z = 2
     assert len(G.world_filter(el, StubWorld(), ident, None)) == 4

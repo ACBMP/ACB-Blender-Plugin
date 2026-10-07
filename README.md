@@ -36,7 +36,7 @@ Instead of the zip, link the checkout so code changes apply on Blender restart:
 
 ```
 git submodule update --init
-python3 -m venv .venv && .venv/bin/pip install -e vendor/anvilforge-py -e . pytest
+python3 -m venv .venv && .venv/bin/pip install -e vendor/anvilforge-py -e . pytest numpy
 mkdir -p ~/.config/blender/5.2/scripts/addons   # Blender only creates it on first add-on install
 ln -s "$PWD/blender/acb_map_editor" ~/.config/blender/5.2/scripts/addons/acb_map_editor
 ```
