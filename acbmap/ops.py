@@ -639,7 +639,8 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = 
                   blank_fakes: bool = False) -> dict:
     """Start a new map from this one: remove every element of `kinds` (default: visible geometry and static
     collision) and every group made only of them, keeping gameplay (spawns, chests, benches, chase breakers, zones,
-    out-of-bounds, crowd flows...). Elements something else still links to are kept. The removed roots' entries
+    out-of-bounds, crowd flows...). Elements something else still links to are kept, and so are elements no grid
+    block lists (runtime templates: effects, pickups, crowd groups). The removed roots' entries
     lose the dependencies only they needed. blank_fakes: the World's FakeEntities (merged far-LOD stand-ins of the old
     buildings, drawn for cells that aren't loaded) draw nothing (zero-length index spans; untested in game, so off by
     default). The navmesh is not touched.
@@ -649,8 +650,13 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = 
     instead of removed (a dangling handle there can't be fixed); keep_collision: see hollow().
     Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped, and the hollowed and template uids."""
     from .kinds import classify, kind_of
+    # elements no grid block lists are templates the game spawns at runtime (effects, pickups, crowd groups:
+    # GFX_Elevator_Lever, AC2MP_PickupEntity...), not scenery: left alone (stripping them crashed the load)
+    listed = {u32(r.id) for b in doc.uids("GridCellDataBlock") for r in doc.obj(b).fields["Objects"]}
     roots = {}
     for e in classify(doc, with_children=False):
+        if e.uid not in listed:
+            continue
         if e.kind in kinds:
             roots[e.uid] = e
         elif e.kind == "group":
