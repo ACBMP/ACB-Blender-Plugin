@@ -169,14 +169,19 @@ def test_clear_scenery(tmp_path):
     from acbmap.kinds import block_membership
     active = block_membership(d2)
     roots = {e.uid for e in classify(d2) if e.kind == "collision" and e.child < 0}
-    assert roots - set(r["templates"]) == {nk[0]}
+    assert roots - set(r["templates"]) - set(r["hollowed"]) == {nk[0]}
     # what the navmeshes name is hollowed, not removed: no dangling handle in a root acbmap can't rewrite
     pinned = ops.opaque_references(MapDocument(MAP))
     assert r["hollowed"] and all(u in d2.info for u in r["hollowed"])
     gone = set(MapDocument(MAP).info) - set(d2.info)
     assert not gone & pinned
-    hollow_kinds = {e.kind for e in classify(d2, False) if e.uid in set(r["hollowed"])}
-    assert not hollow_kinds & {"collision", "visual"}
+    hollowed = [e for e in classify(d2) if e.uid in set(r["hollowed"])]
+    assert not any(n == "Visual" for e in hollowed for n in e.components)
+    for e in hollowed:   # collision kept (the navmesh may ask for the rigid body), shapes collapsed out of the way
+        for _i, ic in ops.inert_components(e.obj):
+            sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
+            if d2.type_of(sid) == "MeshShape":
+                assert max(v[2] for v in mesh_shape_geometry(d2.obj(sid))[0]) < -499
     assert not set(r["templates"]) & set(active) and nk[0] in active
     assert not ops.compounds(d2)
     from acbmap.checks import new_problems

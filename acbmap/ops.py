@@ -605,30 +605,48 @@ def opaque_references(doc: MapDocument) -> set[int]:
 HOLLOW_COMPONENTS = {"Visual", "InertComponent", "MultiInertComponent", "GuidanceSystem"}
 
 
-def hollow(doc: MapDocument, uid: int) -> None:
+COLLAPSED_SHAPE = ([(0.0, 0.0, -500.0), (0.01, 0.0, -500.0), (0.0, 0.01, -500.0)], [(0, 1, 2)], [0])
+
+
+def hollow(doc: MapDocument, uid: int, keep_collision: bool = True) -> None:
     """Strip an element (and a group's children) of what makes it seen, solid or climbable, keeping the entity, its
-    other components and its place in its block: for elements something unchangeable still names."""
+    other components and its place in its block: for elements something unchangeable still names (a navmesh's
+    source entity may be asked for its rigid body). keep_collision: the InertComponents stay, each with its own
+    MeshShape collapsed to a 1 cm triangle 500 m below; otherwise they go too."""
+    from .geom import set_mesh_shape_geometry
     o = doc.obj(uid)
-    for x in [o] + (group_children(o) if type_name(o.type_hash) == "EntityGroup" else []):
+    is_group = type_name(o.type_hash) == "EntityGroup"
+    for ci, x in [(-1, o)] + (list(enumerate(group_children(o))) if is_group else []):
+        drop = HOLLOW_COMPONENTS - ({"InertComponent"} if keep_collision else set())
         x.fields["Components"] = [p for p in x.fields.get("Components", [])
-                                  if not (isinstance(p, Ptr) and p.obj is not None
-                                          and type_name(p.obj.type_hash) in HOLLOW_COMPONENTS)]
+                                  if not (isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) in drop)]
+        if keep_collision:
+            unmerge(x)   # its compound (if any) goes with the cleared scenery
+            for k, (_i, ic) in enumerate(inert_components(x)):
+                sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
+                if sid not in doc.info or doc.type_of(sid) != "MeshShape":
+                    continue
+                nsid = make_shape_unique(doc, (uid, ci), k)
+                set_mesh_shape_geometry(doc.obj(nsid), *COLLAPSED_SHAPE)
+                doc.touch(nsid)
     doc.touch(uid)
 
 
 SCENERY_KINDS = {"visual", "collision"}
 
 
-def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
+def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = True,
+                  blank_fakes: bool = False) -> dict:
     """Start a new map from this one: remove every element of `kinds` (default: visible geometry and static
     collision) and every group made only of them, keeping gameplay (spawns, chests, benches, chase breakers, zones,
     out-of-bounds, crowd flows...). Elements something else still links to are kept. The removed roots' entries
-    lose the dependencies only they needed, and the World's FakeEntities (merged far-LOD stand-ins of the old
-    buildings, drawn for cells that aren't loaded) draw nothing. The navmesh is not touched.
+    lose the dependencies only they needed. blank_fakes: the World's FakeEntities (merged far-LOD stand-ins of the old
+    buildings, drawn for cells that aren't loaded) draw nothing (zero-length index spans; untested in game, so off by
+    default). The navmesh is not touched.
     The few elements new geometry is cloned from (template_roots) are kept but taken out of every grid block, so the
     game never adds them; Mesh to Collision/Scenery keep working on the cleared map. Elements an undecodable root
     names (opaque_references: the navmeshes' source entities, the benches and elevators they link) are hollowed
-    instead of removed (a dangling handle there can't be fixed).
+    instead of removed (a dangling handle there can't be fixed); keep_collision: see hollow().
     Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped, and the hollowed and template uids."""
     from .kinds import classify, kind_of
     roots = {}
@@ -701,12 +719,12 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
     _remove_from_blocks(doc, gone | templates)
     doc.remove_roots(gone)
     for u in hollowed:
-        hollow(doc, u)
+        hollow(doc, u, keep_collision)
     for t in templates:
         if unmerge(doc.obj(t)):
             doc.touch(t)
 
-    for f in doc.uids("FakeEntities"):
+    for f in doc.uids("FakeEntities") if blank_fakes else []:
         fo = doc.obj(f)
         if fo is None:
             continue

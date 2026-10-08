@@ -520,10 +520,10 @@ class Session:
         e = Element(kind, key[0], o, key[1], names, ops.owning_block(self.doc, key[0]))
         return self._element_object(e, name)   # named at creation: the session maps keys to object names
 
-    def clear_scenery(self, kinds=ops.SCENERY_KINDS) -> dict:
+    def clear_scenery(self, kinds=ops.SCENERY_KINDS, **kw) -> dict:
         """ops.clear_scenery, then drop the Blender objects of what it removed."""
         self.sync()
-        res = ops.clear_scenery(self.doc, kinds)
+        res = ops.clear_scenery(self.doc, kinds, **kw)
         gone = [k for k in self.objects if parse_key(k.split("|")[0])[0] not in self.doc.info]
         for k in gone:
             ob = bpy.data.objects.get(self.objects.pop(k))

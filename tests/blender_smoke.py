@@ -181,12 +181,13 @@ print("SMOKE clear", r, "problems", probs2)
 from acbmap.kinds import block_membership
 active2 = block_membership(d2)
 left_roots = {e.uid for e in els2 if e.kind == "collision" and e.child < 0}
-check(r["removed"] > 100 and left_roots == set(r["templates"]) and not O.compounds(d2)
-      and not left_roots & set(active2),
-      "clear scenery removed the collision roots (templates kept, never activated) and every compound")
+check(r["removed"] > 100 and left_roots <= set(r["templates"]) | set(r["hollowed"]) and not O.compounds(d2)
+      and not set(r["templates"]) & set(active2),
+      "clear scenery removed the collision roots (left: templates, never activated; hollowed ones the navmesh "
+      "names) and every compound")
 check({k: sum(1 for e in els2 if e.kind == k) for k in n_before} == n_before, f"gameplay kept {n_before}")
 check(not [o for o in sc2.objects if o.get("acb_kind") == "collision" and not o.get("acb_part")
-           and not o.get("acb_template") and o.parent is None],
+           and not o.get("acb_template") and not o.get("acb_hollow") and o.parent is None],
       "Blender collision objects removed (left: hidden templates, parts of kept gameplay groups)")
 check(not probs2, "no new structural problems after clearing")
 print("SMOKE RESULT", "PASS" if ok else "FAIL")
