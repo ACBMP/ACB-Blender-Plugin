@@ -654,7 +654,7 @@ SCENERY_KINDS = {"visual", "collision"}
 
 def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = True,
                   blank_fakes: bool = False, hollow_pinned: bool = True, prune_deps: bool = True,
-                  hollow_mode: str = "park") -> dict:
+                  hollow_mode: str = "park", keep=frozenset()) -> dict:
     """Start a new map from this one: remove every element of `kinds` (default: visible geometry and static
     collision) and every group made only of them, keeping gameplay (spawns, chests, benches, chase breakers, zones,
     out-of-bounds, crowd flows...). Elements something else still links to are kept, and so are elements no grid
@@ -673,7 +673,7 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = 
     listed = {u32(r.id) for b in doc.uids("GridCellDataBlock") for r in doc.obj(b).fields["Objects"]}
     roots = {}
     for e in classify(doc, with_children=False):
-        if e.uid not in listed:
+        if e.uid not in listed or e.uid in keep:   # keep: roots the caller wants left alone
             continue
         if e.kind in kinds:
             roots[e.uid] = e
