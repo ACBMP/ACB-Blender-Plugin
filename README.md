@@ -43,7 +43,8 @@ ln -s "$PWD/blender/acb_map_editor" ~/.config/blender/5.2/scripts/addons/acb_map
 
 Tests: `.venv/bin/pytest tests/` (headless edits), and
 `blender --background --factory-startup --python tests/blender_smoke.py -- <map forge>` (the add-on end to end;
-`tests/blender_oob.py` the same way for the out-of-bounds wall).
+`tests/blender_oob.py` the same way for the out-of-bounds wall;
+`xvfb-run -a blender --factory-startup --python tests/blender_oob_ui.py -- <forge>` edits it in Edit Mode, which needs a window).
 They read a real map, `$ACB_MULTI` (default: the vbox install path).
 
 ## Workflow (Blender)

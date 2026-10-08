@@ -724,30 +724,53 @@ class Session:
         return wob
 
     @staticmethod
-    def wall_state(wob) -> bytes:
-        """What a wall object's edit changes: world-space corners, edges and heights."""
+    def wall_geometry(wob):
+        """(world-space corner points, per-corner heights or None, edges) of a wall object. In Edit Mode the mesh's
+        generic attributes have no data from Python (len 0, even after update_from_editmode), so everything is
+        read from the edit BMesh there."""
+        import bmesh
         me = wob.data
         M = wob.matrix_world
+        if wob.mode == "EDIT":
+            bm = bmesh.from_edit_mesh(me)
+            bm.verts.index_update()
+            layer = bm.verts.layers.float.get("acb_height")
+            pts = [tuple(M @ v.co) for v in bm.verts]
+            hs = [v[layer] for v in bm.verts] if layer is not None else None
+            edges = [tuple(v.index for v in e.verts) for e in bm.edges]
+            return pts, hs, edges
         attr = me.attributes.get("acb_height")
-        hs = [d.value for d in attr.data] if attr is not None and len(attr.data) == len(me.vertices) else []
-        pts = [x for v in me.vertices for x in (M @ v.co)]
-        return (struct.pack(f"<{len(pts)}f", *pts) + struct.pack(f"<{len(hs)}f", *hs)
-                + struct.pack(f"<{2 * len(me.edges)}I", *sorted(i for e in me.edges for i in e.vertices)))
-
-    @staticmethod
-    def walls_from_object(wob) -> "list[OOB.Wall]":
-        """A wall object's polyline as walls: corners in world space; new vertices without a height (extruded ones
-        copy theirs) get the median."""
-        me = wob.data
-        M = wob.matrix_world
         pts = [tuple(M @ v.co) for v in me.vertices]
-        attr = me.attributes.get("acb_height")
-        hs = [d.value for d in attr.data] if attr is not None and len(attr.data) == len(pts) else []
-        med = sorted(hs)[len(hs) // 2] if hs else 10.0
-        hs = [h if h > 0.01 else med for h in hs] or [med] * len(pts)
+        hs = [d.value for d in attr.data] if attr is not None and len(attr.data) == len(pts) else None
+        return pts, hs, [tuple(e.vertices) for e in me.edges]
+
+    @classmethod
+    def wall_state(cls, wob) -> bytes:
+        """What a wall object's edit changes: world-space corners, edges and heights."""
+        pts, hs, edges = cls.wall_geometry(wob)
+        flat = [x for p in pts for x in p]
+        hs = hs or []
+        return (struct.pack(f"<{len(flat)}f", *flat) + struct.pack(f"<{len(hs)}f", *hs)
+                + struct.pack(f"<{2 * len(edges)}I", *sorted(i for e in edges for i in e)))
+
+    @classmethod
+    def walls_from_object(cls, wob, current: "list[OOB.Wall]" = ()) -> "list[OOB.Wall]":
+        """A wall object's polyline as walls (corners in world space). A corner without a usable height (attribute
+        missing, or 0) takes the height of the nearest corner of `current` (the walls as the document has them);
+        nothing is ever made up."""
+        pts, hs, edges = cls.wall_geometry(wob)
+        ref = [(p, h) for w in current for p, h in zip(w.corners, w.heights)]
+        if hs is None:
+            hs = [0.0] * len(pts)
+        known = [(p, h) for p, h in zip(pts, hs) if h > 0.01] or ref
+        if not known:
+            raise ValueError("the wall has no heights (acb_height attribute) and nothing to take them from")
+
+        def nearest(p):
+            return min(known, key=lambda q: (q[0][0] - p[0]) ** 2 + (q[0][1] - p[1]) ** 2)[1]
+        hs = [h if h > 0.01 else nearest(p) for p, h in zip(pts, hs)]
         adj = {i: set() for i in range(len(pts))}
-        for e in me.edges:
-            a, b = e.vertices
+        for a, b in edges:
             if a != b:
                 adj[a].add(b)
                 adj[b].add(a)
@@ -941,7 +964,7 @@ class Session:
                 if self.baseline.get(k) == st:
                     continue
                 try:
-                    r = OOB.write_walls(doc, parse_key(ek), self.walls_from_object(ob))
+                    r = OOB.write_walls(doc, parse_key(ek), self.walls_from_object(ob, OOB.walls(doc, parse_key(ek))))
                 except ValueError as ex:
                     log.append(f"NOT changed {ob.name}: {ex}")
                     continue
