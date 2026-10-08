@@ -534,6 +534,12 @@ class Session:
                 bpy.data.objects.remove(ob)
         for me in [m for m in bpy.data.meshes if m.users == 0 and ("acb_shape" in m or m.name.startswith("ACB"))]:
             bpy.data.meshes.remove(me)
+        for u in res["hollowed"]:   # still in the map (the navmesh names them) but shown/solid no more
+            ob = bpy.data.objects.get(self.objects.get(keystr((u, -1)), ""))
+            for x in [ob] + list(ob.children_recursive) if ob is not None else []:
+                x["acb_hollow"] = True
+                x.hide_set(True, view_layer=self.scene.view_layers[0])
+                x.hide_render = True
         for t in res["templates"]:   # kept for cloning only, never added to the world: out of the way
             ob = bpy.data.objects.get(self.objects.get(keystr((t, -1)), ""))
             if ob is not None:

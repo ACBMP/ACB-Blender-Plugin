@@ -580,6 +580,42 @@ def delete_many(doc: MapDocument, keys) -> dict:
     return out
 
 
+def opaque_references(doc: MapDocument) -> set[int]:
+    """Ids named in the raw bytes of roots acbmap can't decode (NavMeshManager: each navmesh's source entity, and the
+    benches, elevators and crowd flows it links). Those links can't be edited, so what they name must not go.
+    A superset (every 4-byte window that is a known root id), cached."""
+    if getattr(doc, "_opaque_refs", None) is None:
+        import numpy as np
+        known = np.fromiter(doc.info, dtype=np.uint32)
+        found = set()
+        for u in doc.info:
+            if doc.root(u) is not None:
+                continue
+            b = doc.payload(u)
+            for k in range(4):
+                n = (len(b) - k) // 4
+                if n > 0:
+                    v = np.frombuffer(b, dtype="<u4", count=n, offset=k)
+                    found.update(int(x) for x in np.intersect1d(v, known))
+        found.discard(0)
+        doc._opaque_refs = found
+    return doc._opaque_refs
+
+
+HOLLOW_COMPONENTS = {"Visual", "InertComponent", "MultiInertComponent", "GuidanceSystem"}
+
+
+def hollow(doc: MapDocument, uid: int) -> None:
+    """Strip an element (and a group's children) of what makes it seen, solid or climbable, keeping the entity, its
+    other components and its place in its block: for elements something unchangeable still names."""
+    o = doc.obj(uid)
+    for x in [o] + (group_children(o) if type_name(o.type_hash) == "EntityGroup" else []):
+        x.fields["Components"] = [p for p in x.fields.get("Components", [])
+                                  if not (isinstance(p, Ptr) and p.obj is not None
+                                          and type_name(p.obj.type_hash) in HOLLOW_COMPONENTS)]
+    doc.touch(uid)
+
+
 SCENERY_KINDS = {"visual", "collision"}
 
 
@@ -590,8 +626,10 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
     lose the dependencies only they needed, and the World's FakeEntities (merged far-LOD stand-ins of the old
     buildings, drawn for cells that aren't loaded) draw nothing. The navmesh is not touched.
     The few elements new geometry is cloned from (template_roots) are kept but taken out of every grid block, so the
-    game never adds them; Mesh to Collision/Scenery keep working on the cleared map.
-    Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped, and the template uids."""
+    game never adds them; Mesh to Collision/Scenery keep working on the cleared map. Elements an undecodable root
+    names (opaque_references: the navmeshes' source entities, the benches and elevators they link) are hollowed
+    instead of removed (a dangling handle there can't be fixed).
+    Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped, and the hollowed and template uids."""
     from .kinds import classify, kind_of
     roots = {}
     for e in classify(doc, with_children=False):
@@ -617,14 +655,18 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
             if i in sub_owner:
                 keep_roots.add(sub_owner[i])
     gone = set(roots) - keep_roots
+    # named by an undecodable root (a navmesh's source entity, a bench it links...): hollowed, not removed
+    pinned = opaque_references(doc)
+    hollowed = {u for u in gone if any(u32(o.id) in pinned for o in walk(doc.obj(u)))}
+    gone -= hollowed
     # what new collision/scenery/climb edges are cloned from stays, but in no block: never added to the world
-    templates = set(template_roots(doc)) & gone
+    templates = set(template_roots(doc, exclude=hollowed)) & gone
     gone -= templates
     # compounds: one whose members all go goes too; one that keeps some (benches...) is dissolved
     member_root = {u32(e.obj.id): e.uid for e in classify(doc)}
     dissolved = 0
     for m, mem in list(comps.items()):
-        hit = [i for i in mem if member_root.get(i) in gone]
+        hit = [i for i in mem if member_root.get(i) in gone | hollowed]
         if not hit:
             continue
         if len(hit) == len(mem):
@@ -658,6 +700,8 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
 
     _remove_from_blocks(doc, gone | templates)
     doc.remove_roots(gone)
+    for u in hollowed:
+        hollow(doc, u)
     for t in templates:
         if unmerge(doc.obj(t)):
             doc.touch(t)
@@ -673,7 +717,8 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
         doc.touch(f)
     if hasattr(doc, "_all_ids"):
         doc._all_ids = None
-    return {"removed": len(gone), "kept_referenced": len(set(roots) - gone - templates), "templates": sorted(templates),
+    return {"removed": len(gone), "hollowed": sorted(hollowed),
+            "kept_referenced": len(set(roots) - gone - templates - hollowed), "templates": sorted(templates),
             "compounds_dissolved": dissolved, "deps_dropped": dropped}
 
 
@@ -730,13 +775,13 @@ def strip_guidance(o: Obj) -> bool:
     return True
 
 
-def collision_template(doc: MapDocument):
+def collision_template(doc: MapDocument, exclude=frozenset()):
     """A plain static collision entity of this map to clone new collision from (only Inert/Guidance/Visual
     components, one shape)."""
     from .kinds import classify
     best = None
     for e in classify(doc, with_children=False):
-        if e.kind != "collision":
+        if e.kind != "collision" or e.uid in exclude:
             continue
         names = set(e.components)
         if names <= {"InertComponent", "GuidanceSystem", "Visual"} and len(inert_components(e.obj)) == 1:
@@ -749,19 +794,19 @@ def collision_template(doc: MapDocument):
     return best[1]
 
 
-def template_roots(doc: MapDocument) -> list[int]:
+def template_roots(doc: MapDocument, exclude=frozenset()) -> list[int]:
     """Root uids new geometry is cloned from: the collision template, the element holding the visual template and
     the one holding a climb-edge template (acbmap.guidance.template_system)."""
     from .guidance import systems, template_system
     from .kinds import classify, components
     out = []
     try:
-        out.append(collision_template(doc).uid)
+        out.append(collision_template(doc, exclude).uid)
     except EditError:
         pass
     try:
-        vt = visual_template(doc)
-        gt = template_system(doc)
+        vt = visual_template(doc, exclude)
+        gt = template_system(doc, exclude)
     except (EditError, ValueError):
         vt = gt = None
     for e in classify(doc):
@@ -796,10 +841,12 @@ def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_k
 
 # ------------------------------------------------------------------ visual meshes --
 
-def visual_template(doc: MapDocument) -> Obj:
+def visual_template(doc: MapDocument, exclude=frozenset()) -> Obj:
     """A retail Visual component that shows a Mesh directly (InstanceData = MeshInstanceData), to clone."""
     from .kinds import classify, components
     for e in classify(doc):
+        if e.uid in exclude:
+            continue
         for n, c in components(e.obj):
             if n != "Visual":
                 continue

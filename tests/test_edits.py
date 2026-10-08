@@ -170,6 +170,13 @@ def test_clear_scenery(tmp_path):
     active = block_membership(d2)
     roots = {e.uid for e in classify(d2) if e.kind == "collision" and e.child < 0}
     assert roots - set(r["templates"]) == {nk[0]}
+    # what the navmeshes name is hollowed, not removed: no dangling handle in a root acbmap can't rewrite
+    pinned = ops.opaque_references(MapDocument(MAP))
+    assert r["hollowed"] and all(u in d2.info for u in r["hollowed"])
+    gone = set(MapDocument(MAP).info) - set(d2.info)
+    assert not gone & pinned
+    hollow_kinds = {e.kind for e in classify(d2, False) if e.uid in set(r["hollowed"])}
+    assert not hollow_kinds & {"collision", "visual"}
     assert not set(r["templates"]) & set(active) and nk[0] in active
     assert not ops.compounds(d2)
     from acbmap.checks import new_problems

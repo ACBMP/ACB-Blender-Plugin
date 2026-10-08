@@ -366,10 +366,12 @@ def _all_nodes(g: Obj):
     return g.fields["Partitioner"].obj.fields["ListNodes"]
 
 
-def template_system(doc: MapDocument) -> Obj:
+def template_system(doc: MapDocument, exclude=frozenset()) -> Obj:
     """A retail GuidanceSystem of this map with a single-leaf partitioner and ledge edges, to clone from."""
     from .kinds import classify
     for e in classify(doc, with_children=False):
+        if e.uid in exclude:
+            continue
         for g in systems(e.obj):
             nodes = _all_nodes(g)
             if (len(nodes) == 1 and g.fields["GuidanceObjects"]
