@@ -400,8 +400,28 @@ class ACB_OT_edit_boundary(bpy.types.Operator):
         context.view_layer.objects.active = wob
         bpy.ops.object.mode_set(mode="EDIT")
         bpy.ops.mesh.select_mode(type="VERT")
-        self.report({"INFO"}, "boundary in Edit Mode: G move, E extend, X > Dissolve Vertices remove; then Apply")
+        self._top_view(context)
+        self.report({"INFO"}, "boundary in Edit Mode (top view, X-ray): click corners, G move, E extend, "
+                              "X > Dissolve Vertices remove; then Apply")
         return {"FINISHED"}
+
+    @staticmethod
+    def _top_view(context):
+        """X-ray on (corners behind the wall surface or inside the ground stay clickable), top view, framed on the
+        whole boundary, nothing selected."""
+        area = context.area if context.area and context.area.type == "VIEW_3D" else next(
+            (a for a in context.screen.areas if a.type == "VIEW_3D"), None) if context.screen else None
+        if area is None:
+            return
+        region = next((r for r in area.regions if r.type == "WINDOW"), None)
+        space = area.spaces.active
+        space.shading.show_xray = True
+        space.shading.show_xray_wireframe = True
+        with context.temp_override(area=area, region=region, space_data=space):
+            bpy.ops.view3d.view_axis(type="TOP")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.view3d.view_selected()
+            bpy.ops.mesh.select_all(action="DESELECT")
 
 
 class ACB_OT_make_unique(bpy.types.Operator):

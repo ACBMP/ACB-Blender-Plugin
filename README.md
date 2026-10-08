@@ -72,12 +72,8 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      that sit less than the minimum drop above any floor (adjust *Min ledge depth* / *Min wall drop* / *Use
      surrounding geometry* in the redo panel); **Remove Climb Edges** drops them. After reshaping collision that has ledges, Apply reports them as stale.
    - Trigger zones (cube/sphere empties under their element): move or scale them.
-   - **Out-of-bounds boundary:** one wall object per map (`…:wall`, under the out-of-bounds element): a polyline
-     of the wall's base corners, drawn as a wall. In edit mode, move corners (G), add them (E to extend, or
-     subdivide a segment) and remove them (X → Dissolve Vertices); each corner's wall height is the `acb_height`
-     attribute (new corners copy their neighbour's). On Apply, the gameplay sections (tiles of at most 5 m), the
-     collision strip and the fog mesh are all regenerated from it, so the wall stays one connected piece. Sections
-     face the inside of a closed boundary; open walls keep the side they had.
+   - **Out-of-bounds boundary:** one wall object per map (`…:wall`, under the out-of-bounds element), edited as
+     one connected piece. See [Editing the out-of-bounds boundary](#editing-the-out-of-bounds-boundary).
    - **Add Element**: places a copy of one of the map's own spawns, benches, haystacks, chase breakers, etc. at
      the 3D cursor.
    - **Escort Paths**: select crowd-flow points and use *Append Selected Flows*. Toggle VIP spawn/checkpoint per
@@ -91,6 +87,29 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
 
 Undo: Blender undo covers everything up to *Apply*. Inspector edits go straight into the document and aren't
 undoable, so to back out, reopen the map.
+
+## Editing the out-of-bounds boundary
+
+The boundary is a polyline: one vertex per wall corner, at the **base** of the wall (where it meets the ground).
+The wall surface above it is only a display of the wall's height.
+
+1. **Edit Boundary** (ACB panel, Tools). It selects the wall, enters Edit Mode with vertex selection, turns X-ray
+   on and switches to a top view framed on the whole boundary. By hand: select the `…:wall` object, Tab, 1
+   (vertex select), Alt+Z (X-ray), numpad 7 (top view).
+2. Select corners: click a corner dot (it turns orange); Shift+click adds to the selection, B box-selects,
+   C brush-selects, Alt+click on a segment selects the whole wall. Without X-ray, corners behind the wall surface
+   or inside the ground can't be clicked.
+3. Edit:
+   - **G** moves the selected corners (G Z: only up/down; G X / G Y: along one axis).
+   - **E** extends the wall with a new corner from a selected end corner.
+   - **Right-click → Subdivide** on a selected segment adds a corner in its middle.
+   - **X → Dissolve Vertices** removes the selected corners (the neighbours are joined).
+   - Each corner's wall height is its `acb_height` attribute (view and edit it in the Spreadsheet editor); new
+     corners copy their neighbour's.
+4. **Apply** (or Save). The gameplay sections (tiles of at most 5 m), the collision strip and the fog mesh are all
+   regenerated from the polyline, so the wall stays one connected piece. Sections face the inside of a closed
+   boundary; open walls keep the side they had. Tab back to Object Mode whenever you like (Apply also picks up
+   edits made while still in Edit Mode).
 
 ## CLI
 
