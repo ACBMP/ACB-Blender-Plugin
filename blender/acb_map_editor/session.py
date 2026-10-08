@@ -477,15 +477,18 @@ class Session:
         bm.free()
         return verts, tris
 
-    def import_mesh(self, ob, collision=True, visible=True, max_size=SP.MAX_SIZE):
+    def import_mesh(self, ob, collision=True, visible=True, max_size=SP.MAX_SIZE, surface="auto"):
         """Turn a plain mesh object into new elements, split into game-sized pieces (acbmap.split), each centred on
         its own origin and placed in the always-loaded cell. collision: static collision (MeshShape), visible: a
-        visual mesh. Returns the new element keys (climb edges are left to the caller, who can then build the
-        world collision once for all of them)."""
+        visual mesh. surface: ground / roof / wall for the collision (auto: the object's custom property acb_surface,
+        else ops.surface_of the whole mesh, so all pieces of one object agree). Returns the new element keys (climb
+        edges are left to the caller, who can then build the world collision once for all of them)."""
         loc, rot, sc = ob.matrix_world.decompose()
         base = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
         mi = self.mesh_input(ob, Matrix.Diagonal((*sc, 1))) if visible else None
         cv, ct = self.collision_geometry(ob) if collision else (None, None)
+        if surface == "auto":
+            surface = ob.get("acb_surface") or (ops.surface_of(cv, ct) if collision else "wall")
         if mi is not None:
             tree, leaves = SP.partition(mi.verts, mi.tris, mi.uvs, max_size=max_size)
             col = SP.assign(tree, cv, ct) if collision else {}
@@ -502,7 +505,7 @@ class Session:
                 v, t, mm = SP.sub_collision(cv, ct, [0] * len(ct), cidx, c)
                 if len(v) > 0xFFFF:
                     raise ValueError(f"{ob.name}: a piece has {len(v)} collision vertices (at most 65535)")
-                nk = ops.new_collision(self.doc, m, v, t, mm)
+                nk = ops.new_collision(self.doc, m, v, t, mm, surface=surface)
                 if vis:
                     ops.set_visual(self.doc, nk, SP.sub_mesh_input(mi, vis, c))
             elif vis:

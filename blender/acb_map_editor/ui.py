@@ -266,7 +266,8 @@ def _import_meshes(op, context, collision: bool, visible: bool):
     made = []   # (key, blender name)
     for ob in [o for o in context.selected_objects if o.type == "MESH" and "acb_key" not in o]:
         try:
-            keys = s.import_mesh(ob, collision=collision, visible=visible, max_size=op.max_size)
+            keys = s.import_mesh(ob, collision=collision, visible=visible, max_size=op.max_size,
+                                 surface=getattr(op, "surface", "auto"))
         except (ops.EditError, ValueError) as ex:
             op.report({"ERROR"}, f"{ob.name}: {ex}")
             continue
@@ -297,6 +298,13 @@ class ACB_OT_new_collision(bpy.types.Operator):
     climb: bpy.props.BoolProperty(name="Climb edges", default=True, description="Generate ledges from the mesh")
     visible: bpy.props.BoolProperty(name="Visible mesh", default=True,
                                     description="Also write the mesh as the object's visible geometry")
+    surface: bpy.props.EnumProperty(
+        name="Surface", default="auto",
+        items=[("auto", "Auto", "The object's acb_surface property, else from the mesh: mostly up-facing = ground, "
+                                "some up-facing area = roof, else wall"),
+               ("ground", "Ground", "A floor: walked on normally, crowd may spawn (IsGround)"),
+               ("roof", "Roof", "A building to climb and run across (IsRoof)"),
+               ("wall", "Wall", "Neither")])
     max_size: bpy.props.FloatProperty(name="Max piece size", default=64.0, min=4.0, max=1000.0, unit="LENGTH",
                                       description="Meshes larger than this (or over 20000 triangles, or a 15-tile "
                                                   "uv span) are split into pieces of at most this size")

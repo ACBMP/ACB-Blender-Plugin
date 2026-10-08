@@ -829,8 +829,15 @@ def collision_template(doc: MapDocument, exclude=frozenset()):
             continue
         names = set(e.components)
         if names <= {"InertComponent", "GuidanceSystem", "Visual"} and len(inert_components(e.obj)) == 1:
-            score = (len(names), len(doc.obj(u32(inert_components(e.obj)[0][1].fields["RigidBody"].fields["Shape"].id))
-                                     .fields["Vertices"]))
+            ic = inert_components(e.obj)[0][1]
+            shape = doc.obj(u32(ic.fields["RigidBody"].fields["Shape"].id))
+            if shape is None or "Vertices" not in shape.fields:
+                continue
+            mats = [u32(m.id) for m in shape.fields.get("Materials", [])]
+            # a clone takes its template's flags and (until replaced) material along: prefer plain solid stone that
+            # needs no copying (a FuzzyZone corner made new ground behave like a ledge)
+            score = (any("Fuzzy" in doc.name_of(m) for m in mats if m in doc.info),
+                     ic.fields.get("IsMerged", b"\x00") != b"\x00", len(names), len(shape.fields["Vertices"]))
             if best is None or score < best[0]:
                 best = (score, e)
     if best is None:
@@ -863,11 +870,84 @@ def template_roots(doc: MapDocument, exclude=frozenset()) -> list[int]:
     return list(dict.fromkeys(out))
 
 
+SURFACES = ("ground", "roof", "wall")
+SMALL_EXTENT, MEDIUM_EXTENT = 2.0, 6.5   # retail: IsSmallObject up to 3.3 m (median 1.8), IsMediumObject 1-6.5 m
+
+
+def collision_material(doc: MapDocument, name: str = "Stone_Clean") -> int:
+    """A CollisionMaterial for new collision: `name`, preferably the copy in the always-loaded cell (nothing to copy
+    along), else the map's most used non-fuzzy one."""
+    from collections import Counter
+    top = doc.entry_of(top_block(doc))
+    cms = doc.uids("CollisionMaterial")
+    named = sorted((doc.entry_of(u) != top, u) for u in cms if doc.name_of(u) == name)
+    if named:
+        return named[0][1]
+    use = Counter()
+    for s_ in doc.uids("MeshShape"):
+        o = doc.obj(s_)
+        for m in o.fields.get("Materials", []) if o is not None else []:
+            if u32(m.id) in doc.info and "Fuzzy" not in doc.name_of(u32(m.id)):
+                use[u32(m.id)] += 1
+    if not use:
+        raise EditError("no collision material in this map")
+    return use.most_common(1)[0][0]
+
+
+def surface_of(verts, tris) -> str:
+    """ground (mostly up-facing: a floor), roof (some up-facing area: a building to run across) or wall."""
+    up = total = 0.0
+    for a, b, c in tris:
+        pa, pb, pc = verts[a], verts[b], verts[c]
+        e1 = [pb[k] - pa[k] for k in range(3)]
+        e2 = [pc[k] - pa[k] for k in range(3)]
+        n = (e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0])
+        area = (n[0] ** 2 + n[1] ** 2 + n[2] ** 2) ** 0.5
+        total += area
+        if area and n[2] / area > 0.7:
+            up += area
+    f = up / total if total else 0.0
+    return "ground" if f >= 0.6 else "roof" if f >= 0.1 else "wall"
+
+
+def set_surface(o: Obj, surface: str) -> None:
+    """Retail flags: floors and stairs IsGround (crowd may spawn), roofs and what one runs across up high IsRoof,
+    walls neither."""
+    if surface not in SURFACES:
+        raise EditError(f"surface must be one of {SURFACES}")
+    for _i, ic in inert_components(o):
+        ic.fields["IsGround"] = b"\x01" if surface == "ground" else b"\x00"
+        ic.fields["IsRoof"] = b"\x01" if surface == "roof" else b"\x00"
+        nav = ic.fields.get("GPSurfaceNavType")
+        if nav is not None:
+            nav.fields["GameplaySurfaceNavType_CrowdSpawn"] = b"\x01" if surface == "ground" else b"\x00"
+
+
+def fit_new_element(o: Obj, pts=None) -> None:
+    """Flags a new element must not inherit from its template: no far-LOD stand-in cell (FakeCellIndex -1; a cell's
+    stand-in replaced the element from afar) and size class from its bounds (a 'medium' 150 m ground piece was
+    culled early). pts: entity-local points to set the bounds from first."""
+    import struct
+    bv = o.fields.get("BoundingVolume")
+    if bv is not None and pts:
+        bv.fields["Min"] = struct.pack("<3f", *(min(p[k] for p in pts) for k in range(3)))
+        bv.fields["Max"] = struct.pack("<3f", *(max(p[k] for p in pts) for k in range(3)))
+        bv.fields["Type"] = (0).to_bytes(4, "little")
+    if "FakeCellIndex" in o.fields:
+        o.fields["FakeCellIndex"] = (-1).to_bytes(len(o.fields["FakeCellIndex"]), "little", signed=True)
+    if bv is not None:
+        lo, hi = struct.unpack("<3f", bv.fields["Min"]), struct.unpack("<3f", bv.fields["Max"])
+        ext = max(hi[k] - lo[k] for k in range(3))
+        o.fields["IsSmallObject"] = b"\x01" if ext <= SMALL_EXTENT else b"\x00"
+        o.fields["IsMediumObject"] = b"\x01" if SMALL_EXTENT < ext <= MEDIUM_EXTENT else b"\x00"
+
+
 def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_key=None,
-                  block: int | None = None) -> tuple[int, int]:
+                  block: int | None = None, surface: str = "auto", material: int | None = None) -> tuple[int, int]:
     """A new static collision entity (no visual, no climb edges) with its own MeshShape, cloned from a plain collision
     entity of the map, in `block` (default: the always-loaded whole-map cell, so it exists wherever it is placed).
-    Returns its key."""
+    The shape uses one collision material (default: collision_material(), Stone_Clean) and the element gets the
+    surface flags of `surface` (ground / roof / wall; auto: surface_of the geometry). Returns its key."""
     from .geom import set_mesh_shape_geometry
     t = template_key or collision_template(doc).key
     key = duplicate(doc, t, matrix, block if block is not None else top_block(doc))
@@ -877,7 +957,11 @@ def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_k
     strip_guidance(o)
     sid = make_shape_unique(doc, key)
     shape = doc.obj(sid)
-    set_mesh_shape_geometry(shape, verts, tris, mats)
+    m0 = shape.fields["Materials"][0]
+    shape.fields["Materials"] = [Ref(m0.tag, m0.extra, idb(material or collision_material(doc)))]
+    set_mesh_shape_geometry(shape, verts, tris, [0] * len(tris))
+    set_surface(o, surface_of(verts, tris) if surface == "auto" else surface)
+    fit_new_element(o, list(verts))
     doc.touch(sid)
     doc.touch(key[0])
     return key
@@ -951,6 +1035,8 @@ def set_visual(doc: MapDocument, key, mesh_input) -> int:
         bv.fields["Min"] = struct.pack("<3f", *(min(p[k] for p in pts) for k in range(3)))
         bv.fields["Max"] = struct.pack("<3f", *(max(p[k] for p in pts) for k in range(3)))
         bv.fields["Type"] = (0).to_bytes(4, "little")
+    if is_editor_id(key[0]):   # bounds changed: an editor-made element's size class follows
+        fit_new_element(o)
     doc.touch(key[0])
     return mesh_uid
 
@@ -966,4 +1052,5 @@ def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None,
                               if not (isinstance(p, Ptr) and p.obj is not None
                                       and type_name(p.obj.type_hash) in ("InertComponent", "GuidanceSystem"))]
     set_visual(doc, key, mesh_input)
+    fit_new_element(o)
     return key

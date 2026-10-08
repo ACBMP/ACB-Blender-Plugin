@@ -227,3 +227,25 @@ def test_new_ids_avoid_engine_runtime_range(tmp_path):
     assert count(d2, "spawn") == count(MapDocument(MAP), "spawn") + 1
     from acbmap.checks import new_problems
     assert new_problems(d2, MapDocument(MAP)) == []
+
+
+def test_new_collision_surface_and_flags(tmp_path):
+    """New collision gets a solid collision material (no FuzzyZone copy), retail surface flags (a floor is IsGround:
+    otherwise the player moves on it as on a ledge) and its own size class, no far-LOD stand-in cell."""
+    d = MapDocument(MAP)
+    floor = [(-20, -20, 0), (20, -20, 0), (20, 20, 0), (-20, 20, 0)]
+    m = d.obj(d.uids("Entity")[0]).fields["GlobalMatrix"]
+    k1 = ops.new_collision(d, set_position(m, (0.0, 0.0, 0.0)), floor, [(0, 1, 2), (0, 2, 3)], [0, 0])
+    tower = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 10), (1, 0, 10), (1, 1, 10), (0, 1, 10)]
+    walls = [(0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    k2 = ops.new_collision(d, set_position(m, (5.0, 0.0, 0.0)), tower, walls, [0] * 8)
+    d2 = reopen(d, tmp_path)
+    for k, ground in ((k1, True), (k2, False)):
+        o = ops.element_obj(d2, k)
+        ic = ops.inert_components(o)[0][1]
+        assert ic.fields["IsGround"] == (b"\x01" if ground else b"\x00") and ic.fields["IsRoof"] == b"\x00"
+        sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
+        assert [d2.name_of(u32(x.id)) for x in d2.obj(sid).fields["Materials"]] == ["Stone_Clean"]
+        assert int.from_bytes(o.fields["FakeCellIndex"], "little", signed=True) == -1
+        assert o.fields["IsSmallObject"] == b"\x00" and o.fields["IsMediumObject"] == b"\x00"   # 40 m, 10 m: large
+    assert not [u for u in d2.uids("CollisionMaterial") if ops.is_editor_id(u)]   # nothing copied
