@@ -259,3 +259,45 @@ def test_copy_edits_after_duplicate_are_saved(tmp_path):
     ops.fit_new_element(ops.element_obj(d, k))
     d2 = reopen(d, tmp_path)
     assert int.from_bytes(ops.element_obj(d2, k).fields["FakeCellIndex"], "little", signed=True) == -1
+
+
+def test_new_collision_goes_into_the_cell_under_it():
+    """Retail buildings live in the 32 m level-0 grid cells; in the whole-map cell they aren't drawn or climbable."""
+    d = MapDocument(MAP)
+    size, bx, by, n = ops.grid_layout(d)
+    floor = [(-1.0, -1.0, 0.0), (1.0, -1.0, 0.0), (1.0, 1.0, 0.0), (-1.0, 1.0, 0.0)]
+    m = ops.element_obj(d, ops.collision_template(d).key).fields["GlobalMatrix"]
+    x, y = bx + 2.5 * size, by + 3.5 * size
+    k = ops.new_collision(d, set_position(m, (x, y, 0.0)), floor, [(0, 1, 2), (0, 2, 3)], [0, 0])
+    blk = ops.owning_block(d, k[0])
+    assert d.name_of(blk) == f"Cell{3 * n + 2:05d}_DataBlock" == d.name_of(ops.cell_block(d, x, y))
+    ic = ops.inert_components(ops.element_obj(d, k))[0][1]
+    assert d.entry_of(u32(ic.fields["RigidBody"].fields["Shape"].id)) == d.entry_of(blk)
+    far = ops.cell_block(d, bx - 1000.0, by + n * size + 1000.0)     # beyond the grid: its corner cell
+    assert d.name_of(far) in (f"Cell{(n - 1) * n:05d}_DataBlock", d.name_of(ops.top_block(d)))
+
+
+def test_localized_copy_takes_its_texture_entries_along():
+    """A material copied into another entry needs the texture entries its own entry listed as dependencies."""
+    d = MapDocument(MAP)
+    blocks = [b for b in d.uids("GridCellDataBlock") if d.entry_root(d.entry_of(b)) == b]
+    always = ops.always_loaded_entries(d)
+    entries = {e.id & 0xFFFFFFFF for e in d.entries}
+    for mat in d.uids("Material"):
+        src = d.where[mat][0][0]
+        if src in always:
+            continue
+        have = {x.id & 0xFFFFFFFF for x in d._file(src).deps}
+        need = {i for i in ops.linked_ids(d.obj(mat)) if i in entries and i in have}
+        dst = next((d.entry_of(b) for b in blocks if d.entry_of(b) not in (src, *always)), None)
+        if need and dst and not need <= {x.id & 0xFFFFFFFF for x in d._file(dst).deps}:
+            break
+    else:
+        pytest.skip("no material with texture entries to move")
+    from anvilforge.fastload import Handle
+    from acbmap.doc import idb
+    o = ops.element_obj(d, ops.collision_template(d).key)
+    probe = ops.clone_tree(d, o)
+    probe.fields["_probe"] = Handle(0, idb(mat))   # something linking the material
+    assert ops.localize_links(d, probe, dst) >= 1
+    assert need <= {x.id & 0xFFFFFFFF for x in d._file(dst).deps}

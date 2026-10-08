@@ -152,10 +152,16 @@ chosen = int(acb_mat["acb_vis_material"], 16)
 check(gc is not None and len(gc.tris) == 12 and len(gc.materials) == 1
       and (gc.materials[0] == chosen or d.name_of(gc.materials[0]).startswith(d.name_of(chosen) + "_l")),
       "visible collision cube written with the chosen map material (or its always-loaded copy)")
-top = O.top_block(d)
 big = [S.parse_key(o["acb_key"]) for o in pieces]
-check(res_big == {"FINISHED"} and len(big) >= 9 and all(O.owning_block(d, k[0]) == top for k in big),
-      f"big mesh split into {len(big)} pieces, all in the always-loaded cell")
+
+
+def cell_under(k):
+    x, y, _z = position(O.element_obj(d, k).fields["GlobalMatrix"])
+    return O.cell_block(d, x, y)
+
+
+check(res_big == {"FINISHED"} and len(big) >= 9 and all(O.owning_block(d, k[0]) == cell_under(k) for k in big),
+      f"big mesh split into {len(big)} pieces, each in the grid cell under it")
 def shape_tris(k):
     ic = O.inert_components(O.element_obj(d, k))[0][1]
     return len(mesh_shape_geometry(d.obj(int.from_bytes(ic.fields["RigidBody"].fields["Shape"].id, "little")))[1])

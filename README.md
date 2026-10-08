@@ -144,8 +144,10 @@ acbmap install <forge> | uninstall <name> | status
   member dissolves its compound (the compound entity goes, its members get `IsMerged=0` and collide on their own),
   and copies are always unmerged. The checks flag a merged entity outside any compound (it would have no
   collision).
-- New collision and scenery go into the whole-map grid cell, which is always loaded (level-0 cells stream in only
-  within a radius of the World's anchor). Map materials and texture sets they borrow from a cell entry that isn't
+- New collision and scenery go into the level-0 grid cell under each piece's origin (`World.GridLayout`: 32 m
+  cells), where retail activates every building, with the piece's own MeshShape and Mesh in that cell's entry.
+  Tested in game: an element in the whole-map cell (always loaded) collides, but its LOD-selected meshes aren't
+  drawn and its climb edges barely grab; the same element in its 32 m cell is drawn and climbable. Map materials and texture sets they borrow from a cell entry that isn't
   always loaded are copied into the new entry (they live inside cell entries and load only with them).
 
 ## Known limits (milestone 1)

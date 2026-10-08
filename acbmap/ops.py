@@ -430,6 +430,7 @@ def localize_links(doc: MapDocument, o: Obj, dst_fn: str) -> int:
                 memo[(i, dst_fn)] = u32(new.obj.id)
                 fix(new.obj)
                 doc.add_root(dst_fn, new, f"{doc.name_of(i)}_l{u32(new.obj.id) & 0xFFFF:04x}")
+                copy_deps(doc, doc.where[i][0][0], dst_fn, new.obj)   # e.g. its texture entries
                 made += 1
             mapping[i] = memo[(i, dst_fn)]
         if mapping:
@@ -472,6 +473,42 @@ def top_block(doc: MapDocument) -> int:
     if best is None:
         raise EditError("no grid cell blocks in this map")
     return best[1]
+
+
+def grid_layout(doc: MapDocument) -> tuple[float, float, float, int] | None:
+    """(cell size, bottom-left x, bottom-left y, cells per side) of the World's level-0 grid, or None."""
+    import struct
+    for w in doc.uids("World"):
+        g = doc.obj(w).fields.get("GridLayout")
+        if g is not None and "CellSize" in g.fields:
+            f = g.fields
+            return (u32(f["CellSize"]), struct.unpack("<i", f["BottomLeftX"])[0],
+                    struct.unpack("<i", f["BottomLeftY"])[0], u32(f["GridDimensionLevel0"]))
+    return None
+
+
+def cell_block(doc: MapDocument, x: float, y: float) -> int:
+    """The level-0 GridCellDataBlock covering world point (x, y) (the grid's edge cells cover everything beyond it):
+    where retail activates every building, and where new elements go. Elements in the whole-map cell (top_block)
+    load, but the game neither draws their LOD-selected meshes nor lets the player grab their climb edges. Falls
+    back to top_block when the map has no such cell."""
+    import math
+    g = grid_layout(doc)
+    if g is not None:
+        size, bx, by, n = g
+        col = min(max(math.floor((x - bx) / size), 0), n - 1)
+        row = min(max(math.floor((y - by) / size), 0), n - 1)
+        name = f"Cell{row * n + col:05d}_DataBlock"
+        for b in doc.uids("GridCellDataBlock"):
+            if doc.name_of(b) == name and doc.entry_root(doc.entry_of(b)) == b:
+                return b
+    return top_block(doc)
+
+
+def _block_at(doc: MapDocument, matrix: bytes) -> int:
+    from .geom import position
+    x, y, _z = position(matrix)
+    return cell_block(doc, x, y)
 
 
 def _copy_name(doc: MapDocument, uid: int) -> str:
@@ -947,12 +984,12 @@ def fit_new_element(o: Obj, pts=None) -> None:
 def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_key=None,
                   block: int | None = None, surface: str = "auto", material: int | None = None) -> tuple[int, int]:
     """A new static collision entity (no visual, no climb edges) with its own MeshShape, cloned from a plain collision
-    entity of the map, in `block` (default: the always-loaded whole-map cell, so it exists wherever it is placed).
+    entity of the map, in `block` (default: the level-0 grid cell under its origin, cell_block).
     The shape uses one collision material (default: collision_material(), Stone_Clean) and the element gets the
     surface flags of `surface` (ground / roof / wall; auto: surface_of the geometry). Returns its key."""
     from .geom import set_mesh_shape_geometry
     t = template_key or collision_template(doc).key
-    key = duplicate(doc, t, matrix, block if block is not None else top_block(doc))
+    key = duplicate(doc, t, matrix, block if block is not None else _block_at(doc, matrix))
     o = element_obj(doc, key)
     o.fields["Components"] = [p for p in o.fields["Components"]
                               if not (isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) == "Visual")]
@@ -1046,9 +1083,9 @@ def set_visual(doc: MapDocument, key, mesh_input) -> int:
 def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None,
                 block: int | None = None) -> tuple[int, int]:
     """A new visual-only element (no collision, no climb edges) showing mesh_input, in `block` (default: the
-    always-loaded whole-map cell). Returns its key."""
+    level-0 grid cell under its origin, cell_block). Returns its key."""
     t = template_key or collision_template(doc).key
-    key = duplicate(doc, t, matrix, block if block is not None else top_block(doc))
+    key = duplicate(doc, t, matrix, block if block is not None else _block_at(doc, matrix))
     o = element_obj(doc, key)
     o.fields["Components"] = [p for p in o.fields["Components"]
                               if not (isinstance(p, Ptr) and p.obj is not None

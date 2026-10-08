@@ -479,7 +479,7 @@ class Session:
 
     def import_mesh(self, ob, collision=True, visible=True, max_size=SP.MAX_SIZE, surface="auto"):
         """Turn a plain mesh object into new elements, split into game-sized pieces (acbmap.split), each centred on
-        its own origin and placed in the always-loaded cell. collision: static collision (MeshShape), visible: a
+        its own origin and placed in the grid cell under that origin (ops.cell_block). collision: static collision (MeshShape), visible: a
         visual mesh. surface: ground / roof / wall for the collision (auto: the object's custom property acb_surface,
         else ops.surface_of the whole mesh, so all pieces of one object agree). Returns the new element keys (climb
         edges are left to the caller, who can then build the world collision once for all of them)."""
