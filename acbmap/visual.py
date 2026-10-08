@@ -215,6 +215,7 @@ class MeshInput:
     tris: list[tuple[int, int, int]]
     tri_material: list[int]                 # index into materials
     materials: list[int]                    # Material uids
+    colors: list[tuple[int, int, int, int]] | None = None   # RGBA per vertex: written as VertexFormat 3
 
 
 MAX_UV = 32767 / 2048
@@ -268,9 +269,10 @@ def _b(x: float) -> int:
 
 
 def encode_static(mi: MeshInput):
-    """Vertex format 4 buffers for mi: (vertex bytes, index bytes, primitives [(min index, vertex count, start
-    index, triangle count)] in material order, vertex order) -- vertices are regrouped so each material's range is
-    contiguous."""
+    """Static vertex buffers for mi -- VertexFormat 4, or 3 when mi.colors is set: (vertex bytes, index bytes,
+    primitives [(min index, vertex count, start index, triangle count)] in material order) -- vertices are
+    regrouped so each material's range is contiguous."""
+    stride = 24 if mi.colors is not None else 20
     if not mi.tris:
         raise ValueError("no triangles")
     by_mat: dict[int, list[int]] = {}
@@ -290,7 +292,7 @@ def encode_static(mi: MeshInput):
         if not tris:
             continue
         remap: dict[int, int] = {}
-        base = len(vb) // 20
+        base = len(vb) // stride
         start = len(ib)
         for ti in tris:
             for i in mi.tris[ti]:
@@ -302,8 +304,11 @@ def encode_static(mi: MeshInput):
                     if abs(u) > 32767 or abs(v) > 32767:
                         raise ValueError(f"uv span over {MAX_UV:.0f} tiles")
                     nn, t = mi.normals[i], tan[i]
-                    vb += struct.pack("<4h4B4B2h", x, y, z, w * sign[i], _b(nn[0]), _b(nn[1]), _b(nn[2]), 255,
-                                      _b(t[0]), _b(t[1]), _b(t[2]), 255, round(u), round(v))
+                    vb += struct.pack("<4h4B4B", x, y, z, w * sign[i], _b(nn[0]), _b(nn[1]), _b(nn[2]), 255,
+                                      _b(t[0]), _b(t[1]), _b(t[2]), 255)
+                    if mi.colors is not None:
+                        vb += bytes(mi.colors[i])
+                    vb += struct.pack("<2h", round(u), round(v))
                 ib.append(remap[i])
         if base + len(remap) > 0xFFFF:
             raise ValueError(f"{base + len(remap)} vertices: at most 65535 per mesh")
@@ -330,14 +335,28 @@ def build_mesh(doc: MapDocument, mi: MeshInput, clone):
     tmpl = static_mesh_template(doc)
     src = doc.root(tmpl)
     o = clone(src.obj)
+    mats = fill_mesh(o, mi, shadows=True)
+    o.fields["SubMeshes"] = []
+    o.fields["Bones"] = []
+    for k in ("FakeMeshGridIndex", "FakeMeshGridCount"):
+        o.fields[k] = bytes(len(o.fields[k]))
+    return type(src)(src.pre_header, src.status, o), mats
+
+
+def fill_mesh(o, mi: MeshInput, shadows: bool | None = None) -> list[int]:
+    """Replace a static Mesh object's buffers and primitives with mi (one primitive per used material), using its own
+    first primitive / instancing entry as the prototype for the per-mesh settings. shadows: whether it gets shadow
+    primitives and casts shadows (None: as it did). Returns the material uids in primitive order."""
     vb, ib, prims = encode_static(mi)
     cm = o.fields["CompiledMesh"].obj
     md = cm.fields["MeshData"]
     proto_prim = md.fields["StandardPrimitives"][0]
     proto_inst = cm.fields["InstancingData"][0]
+    if shadows is None:
+        shadows = bool(md.fields["ShadowPrimitives"])
     md.fields["IsIndexBuffer32bit"] = b"\x00"
-    md.fields["VertexFormat"] = b"\x04"
-    md.fields["VertexStride"] = bytes([20])
+    md.fields["VertexFormat"] = b"\x03" if mi.colors is not None else b"\x04"
+    md.fields["VertexStride"] = bytes([24 if mi.colors is not None else 20])
     std, shadow, inst = [], [], []
     for k, (mat, base, nv, start, ntri) in enumerate(prims):
         p = copy.deepcopy(proto_prim)
@@ -345,9 +364,10 @@ def build_mesh(doc: MapDocument, mi: MeshInput, clone):
                         StartIndex=start.to_bytes(4, "little"), PrimitiveCount=ntri.to_bytes(4, "little"),
                         Type=(1).to_bytes(4, "little"), IsUsingDepthOnlyBuffers=bytes(4))
         std.append(p)
-        shadow.append(copy.deepcopy(p))
+        if shadows:
+            shadow.append(copy.deepcopy(p))
         d = copy.deepcopy(proto_inst)
-        d.fields["ShadowCaster"] = b"\x01"
+        d.fields["ShadowCaster"] = b"\x01" if shadows else b"\x00"
         d.fields["NumBones"] = b"\x00"
         d.fields["SubMeshIndex"] = bytes([k])
         d.fields["NumVertices"] = nv.to_bytes(2, "little")
@@ -362,11 +382,19 @@ def build_mesh(doc: MapDocument, mi: MeshInput, clone):
     cm.fields["InstancingData"] = inst
     ref = o.fields["CompiledMeshMaterials"][0]
     o.fields["CompiledMeshMaterials"] = [type(ref)(ref.tag, ref.extra, idb(mi.materials[m])) for m, *_ in prims]
-    o.fields["SubMeshes"] = []
-    o.fields["Bones"] = []
-    for k in ("FakeMeshGridIndex", "FakeMeshGridCount"):
-        o.fields[k] = bytes(len(o.fields[k]))
-    return type(src)(src.pre_header, src.status, o), [mi.materials[m] for m, *_ in prims]
+    return [mi.materials[m] for m, *_ in prims]
+
+
+def clear_baked_ao(visual_component) -> None:
+    """Drop a Visual's per-vertex baked ambient occlusion (sized to the old vertex count) after its mesh changed;
+    retail instances without it carry an empty buffer."""
+    idata = getattr(visual_component.fields.get("InstanceData"), "obj", None)
+    cmi = getattr(idata.fields.get("CompiledMeshInstance"), "obj", None) if idata is not None else None
+    if cmi is not None:
+        cmi.fields["HasAmbientOcclusion"] = b"\x00"
+        cmi.fields["VertexBuffer"] = []
+        cmi.fields["VertexFormat"] = b"\x00"
+        cmi.fields["MeshHash"] = bytes(len(cmi.fields["MeshHash"]))
 
 
 def default_material(doc: MapDocument) -> int:

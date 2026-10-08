@@ -42,7 +42,8 @@ ln -s "$PWD/blender/acb_map_editor" ~/.config/blender/5.2/scripts/addons/acb_map
 ```
 
 Tests: `.venv/bin/pytest tests/` (headless edits), and
-`blender --background --factory-startup --python tests/blender_smoke.py -- <map forge>` (the add-on end to end).
+`blender --background --factory-startup --python tests/blender_smoke.py -- <map forge>` (the add-on end to end;
+`tests/blender_oob.py` the same way for the out-of-bounds wall).
 They read a real map, `$ACB_MULTI` (default: the vbox install path).
 
 ## Workflow (Blender)
@@ -70,7 +71,13 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      selected elements' edges from their collision, leaving out ledges whose hanging space another object takes or
      that sit less than the minimum drop above any floor (adjust *Min ledge depth* / *Min wall drop* / *Use
      surrounding geometry* in the redo panel); **Remove Climb Edges** drops them. After reshaping collision that has ledges, Apply reports them as stale.
-   - Trigger zones (cube/sphere empties under their element) and out-of-bounds wall quads: move or scale them.
+   - Trigger zones (cube/sphere empties under their element): move or scale them.
+   - **Out-of-bounds boundary:** one wall object per map (`…:wall`, under the out-of-bounds element): a polyline
+     of the wall's base corners, drawn as a wall. In edit mode, move corners (G), add them (E to extend, or
+     subdivide a segment) and remove them (X → Dissolve Vertices); each corner's wall height is the `acb_height`
+     attribute (new corners copy their neighbour's). On Apply, the gameplay sections (tiles of at most 5 m), the
+     collision strip and the fog mesh are all regenerated from it, so the wall stays one connected piece. Sections
+     face the inside of a closed boundary; open walls keep the side they had.
    - **Add Element**: places a copy of one of the map's own spawns, benches, haystacks, chase breakers, etc. at
      the 3D cursor.
    - **Escort Paths**: select crowd-flow points and use *Append Selected Flows*. Toggle VIP spawn/checkpoint per
@@ -129,6 +136,7 @@ acbmap install <forge> | uninstall <name> | status
   found, 178 of 184 generated are retail poles). Ledges follow physical rules, but retail's were placed by hand:
   facades get a ledge on every cornice where retail often has a few, so regenerating a retail object changes how it
   climbs (about a quarter of retail ledge length is reproduced within 15 cm). Not yet tested in game.
-- Out-of-bounds quads: position, rotation and size round-trip exactly. Whether the stored position is the wall's
-  bottom or its centre isn't verified in-game, so the drawn quad may sit half a height off.
+- Out-of-bounds walls: regenerating a retail boundary from its own corners reproduces its sections (centre, normal,
+  size) on 6 of the 9 retail maps that have one exactly; the others differ by one tile split or by up to 22 cm.
+  The fog mesh is rebuilt in the retail pattern (strip plus alpha fins at the corners), not edited in place.
 - Group children can't be copied on their own; copy the whole group.

@@ -6,8 +6,10 @@ Every Blender object that stands for something in the forge carries string custo
   acb_key   "<root uid hex>:<child index>"  -- an element (Entity / EntityGroup root, or a group child)
   acb_kind  element kind (kinds.py)
   acb_part  "" for the element itself; "shape:<n>" collision shape of a multi-shape element (or of any element shown
-            by its visual mesh); "zone:<path>" a trigger zone (path into the element, '/'-separated); "oob:<n>" an
-            out-of-bounds wall section
+            by its visual mesh); "zone:<path>" a trigger zone (path into the element, '/'-separated); "oobwall" the
+            out-of-bounds boundary as one polyline mesh (vertices = wall base corners in world space, per-vertex
+            height in the "acb_height" attribute, drawn as a wall by a Screw modifier); editing it regenerates the
+            element's sections, collision strip and fog mesh (acbmap.oob)
 Collision mesh datablocks carry acb_shape (MeshShape uid hex) and are shared between every entity using the shape,
 like in the game; visual mesh datablocks carry acb_visual (Mesh uid hex) and are shared the same way, but are
 display-only. An element with a visual mesh is that mesh (so clicking the scenery selects it), with its collision as
@@ -25,6 +27,7 @@ import bpy
 from mathutils import Matrix, Quaternion, Vector
 
 from acbmap import guidance as G
+from acbmap import oob as OOB
 from acbmap import ops
 from acbmap import split as SP
 from acbmap import visual as V
@@ -353,7 +356,7 @@ class Session:
         self._zones(e, ob, k)
         self.climb_object(e.obj, ob, k)
         if e.kind == "out_of_bounds":
-            self._oob_sections(e, ob, k)
+            self._oob_wall(e, ob, k)
         return ob
 
     def _shape_mesh(self, ic):
@@ -684,25 +687,79 @@ class Session:
             zob["acb_part"] = "zone:" + "/".join(str(p) for p in path)
             self.objects[f"{k}|{zob['acb_part']}"] = zob.name
 
-    def _oob_sections(self, e, ob, k):
-        oc = component(e.obj, "OutOfBoundsComponent")
-        ci = next(i for i, p in enumerate(e.obj.fields["Components"]) if p.obj is oc)
-        me = bpy.data.meshes.get("ACB_OOB_quad")
-        if me is None:
-            me = bpy.data.meshes.new("ACB_OOB_quad")
-            me.from_pydata([(-0.5, 0, 0), (0.5, 0, 0), (0.5, 0, 1), (-0.5, 0, 1)], [], [(0, 1, 2, 3)])
-        for j, s in enumerate(oc.fields["Sections"]):
-            pos = struct.unpack("<3f", s.fields["GlobalPosition"][:12])
-            qx, qy, qz, qw = struct.unpack("<4f", s.fields["GlobalRotation"])
-            w, h = struct.unpack("<2f", s.fields["Size"])
-            sob = bpy.data.objects.new(f"{ob.name}:oob{j}", me)
-            self.coll("Out of Bounds").objects.link(sob)
-            sob.matrix_world = (Matrix.Translation(pos) @ Quaternion((qw, qx, qy, qz)).to_matrix().to_4x4()
-                                @ Matrix.Diagonal((w, 1, h, 1)))
-            sob.display_type = "WIRE"
-            sob["acb_key"] = k
-            sob["acb_part"] = f"oob:{ci}:{j}"
-            self.objects[f"{k}|{sob['acb_part']}"] = sob.name
+    def _oob_wall(self, e, ob, k):
+        """The element's boundary as one editable polyline (see the module docstring)."""
+        try:
+            ws = OOB.walls(self.doc, e.key)
+        except ValueError:
+            return None
+        verts, edges, heights = [], [], []
+        for w in ws:
+            base, n = len(verts), len(w.corners)
+            verts += w.corners
+            heights += w.heights
+            edges += [(base + i, base + (i + 1) % n) for i in range(n if w.closed else n - 1)]
+        me = bpy.data.meshes.new(f"ACB_OOBWall_{k}")
+        me.from_pydata(verts, edges, [])
+        attr = me.attributes.new("acb_height", "FLOAT", "POINT")
+        attr.data.foreach_set("value", heights)
+        wob = bpy.data.objects.new(f"{ob.name}:wall", me)
+        self.coll("Out of Bounds").objects.link(wob)
+        wob.parent = ob
+        wob.matrix_parent_inverse = ob.matrix_world.inverted()   # vertices stay in world space
+        mod = wob.modifiers.new("Wall height (display)", "SCREW")
+        mod.angle = 0.0
+        mod.screw_offset = sorted(heights)[len(heights) // 2] if heights else 10.0
+        mod.steps = mod.render_steps = 1
+        mod.axis = "Z"
+        mod.use_normal_calculate = True
+        wob.show_wire = True
+        wob.color = (1.0, 0.2, 0.2, 0.6)
+        wob["acb_key"] = k
+        wob["acb_part"] = "oobwall"
+        self.objects[f"{k}|oobwall"] = wob.name
+        return wob
+
+    @staticmethod
+    def wall_state(wob) -> bytes:
+        """What a wall object's edit changes: world-space corners, edges and heights."""
+        me = wob.data
+        M = wob.matrix_world
+        attr = me.attributes.get("acb_height")
+        hs = [d.value for d in attr.data] if attr is not None and len(attr.data) == len(me.vertices) else []
+        pts = [x for v in me.vertices for x in (M @ v.co)]
+        return (struct.pack(f"<{len(pts)}f", *pts) + struct.pack(f"<{len(hs)}f", *hs)
+                + struct.pack(f"<{2 * len(me.edges)}I", *sorted(i for e in me.edges for i in e.vertices)))
+
+    @staticmethod
+    def walls_from_object(wob) -> "list[OOB.Wall]":
+        """A wall object's polyline as walls: corners in world space; new vertices without a height (extruded ones
+        copy theirs) get the median."""
+        me = wob.data
+        M = wob.matrix_world
+        pts = [tuple(M @ v.co) for v in me.vertices]
+        attr = me.attributes.get("acb_height")
+        hs = [d.value for d in attr.data] if attr is not None and len(attr.data) == len(pts) else []
+        med = sorted(hs)[len(hs) // 2] if hs else 10.0
+        hs = [h if h > 0.01 else med for h in hs] or [med] * len(pts)
+        adj = {i: set() for i in range(len(pts))}
+        for e in me.edges:
+            a, b = e.vertices
+            if a != b:
+                adj[a].add(b)
+                adj[b].add(a)
+        return OOB.chains(pts, adj, hs)
+
+    def _refresh_visual(self, uid: int):
+        """Rebuild the Blender mesh of a visual Mesh the document changed (every object showing it follows)."""
+        old = bpy.data.meshes.get(f"ACBVis_{uid:08x}")
+        if old is not None:
+            old.name = f"{old.name}.old"
+        new = self._visual_mesh(uid)
+        if old is not None:
+            if new is not None:
+                old.user_remap(new)
+            bpy.data.meshes.remove(old)
 
     def _build_flow_links(self):
         verts, edges, idx = [], [], {}
@@ -769,7 +826,7 @@ class Session:
                     self.id_to_obj[u32(c.id)] = ob.name
                 if ob.get("acb_kind") in ("crowd_flow", "nav_flow"):
                     self.flow_names[key[0]] = ob.name
-            elif part.startswith(("zone:", "oob:")):
+            elif part.startswith("zone:") or part == "oobwall":
                 self.objects[f"{k}|{part}"] = ob.name
                 self.baseline[f"{k}|{part}"] = self._state(ob)
         for me in bpy.data.meshes:
@@ -801,6 +858,8 @@ class Session:
 
     def _state(self, ob) -> bytes:
         part = ob.get("acb_part", "")
+        if part == "oobwall":
+            return self.wall_state(ob)
         if part.startswith("zone:"):
             return struct.pack("<16f", *[x for row in ob.matrix_basis for x in row])
         return from_blender(ob.matrix_world)
@@ -808,6 +867,9 @@ class Session:
     def sync(self) -> list[str]:
         """Push Blender-side changes into the document. Returns a log of what changed."""
         doc, log = self.doc, []
+        for ob in self.scene.objects:      # edit-mode changes reach ob.data only when flushed
+            if ob.mode == "EDIT" and ob.type == "MESH":
+                ob.update_from_editmode()
         bpy.context.view_layer.update()   # matrix_world of just-moved objects is stale until the depsgraph runs
         by_key: dict[str, list] = {}
         for ob in self.scene.objects:
@@ -871,15 +933,25 @@ class Session:
                 continue
             ob = obs[0]
             st = self._state(ob)
+            ek, part = k.split("|", 1)
+            if part == "oobwall":
+                if self.baseline.get(k) == st:
+                    continue
+                try:
+                    r = OOB.write_walls(doc, parse_key(ek), self.walls_from_object(ob))
+                except ValueError as ex:
+                    log.append(f"NOT changed {ob.name}: {ex}")
+                    continue
+                mesh_uid = OOB.oob_parts(doc, parse_key(ek))[4]
+                if mesh_uid is not None:
+                    self._refresh_visual(mesh_uid)
+                log.append(f"out-of-bounds wall {ob.name}: {r['corners']} corners, {r['sections']} sections")
+                continue
             if self.baseline.get(k) is not None and mat_close(st, self.baseline[k]):
                 continue
-            ek, part = k.split("|", 1)
             if part.startswith("zone:"):
                 self._write_zone(parse_key(ek), part[5:], ob)
                 log.append(f"zone {ob.name}")
-            elif part.startswith("oob:"):
-                self._write_oob(parse_key(ek), part, ob)
-                log.append(f"out-of-bounds section {ob.name}")
         # collision geometry
         for me in bpy.data.meshes:
             if "acb_shape" not in me or me.users == 0:
@@ -933,18 +1005,6 @@ class Session:
         else:
             zo.fields["BoxLocalCenter"] = struct.pack("<4f", *loc, 0)
             zo.fields["BoxHalfExtents"] = struct.pack("<4f", *sc, 0)
-        self.doc.touch(key[0])
-
-    def _write_oob(self, key, part, ob):
-        _t, ci, j = part.split(":")
-        o = ops.element_obj(self.doc, key)
-        s = o.fields["Components"][int(ci)].obj.fields["Sections"][int(j)]
-        loc, rot, sc = ob.matrix_world.decompose()
-        n = rot @ Vector((0, 1, 0))
-        s.fields["GlobalPosition"] = struct.pack("<4f", *loc, 0)
-        s.fields["GlobalRotation"] = struct.pack("<4f", rot.x, rot.y, rot.z, rot.w)
-        s.fields["GlobalNormal"] = struct.pack("<4f", *n, 0)
-        s.fields["Size"] = struct.pack("<2f", sc.x, sc.z)
         self.doc.touch(key[0])
 
     def _write_shape(self, me):
