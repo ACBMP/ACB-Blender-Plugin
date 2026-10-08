@@ -12,7 +12,7 @@ from anvilforge.fileset import iter_fileset_entries
 from .doc import MapDocument, u32
 from .geom import mesh_shape_geometry
 from .kinds import block_membership, classify
-from .ops import ID_RANGE_BASE
+from .ops import RUNTIME_ID_BASE, is_editor_id
 
 
 def check_alignment(forge_path: str) -> list[str]:
@@ -73,7 +73,8 @@ def check_deps(doc: MapDocument) -> list[str]:
 
 
 def check_editor_ids(doc: MapDocument) -> list[str]:
-    """Objects created by the editor (reserved 0xF0xxxxxx range): unique, and every link into the range resolves."""
+    """Objects created by the editor (ops.ID_RANGE_LO..HI): unique, and every link into the range resolves; nothing may
+    use the engine's runtime id range (>= 0xF0000000)."""
     owner: dict[int, int] = {}
     out = []
     links = []
@@ -84,7 +85,10 @@ def check_editor_ids(doc: MapDocument) -> list[str]:
         seen_here = set()
         for o in walk(r.obj):
             i = u32(o.id)
-            if i >> 24 == ID_RANGE_BASE >> 24 and i not in seen_here:
+            if i >= RUNTIME_ID_BASE:
+                out.append(f"ids: {doc.name_of(u)} holds {i:#x}, in the engine's runtime id range (never shows up in "
+                           "game; reopen the map to renumber it)")
+            if is_editor_id(i) and i not in seen_here:
                 seen_here.add(i)
                 if i in owner and owner[i] != u:
                     out.append(f"ids: {i:#x} used in both {doc.name_of(owner[i])} and {doc.name_of(u)}")
@@ -93,7 +97,7 @@ def check_editor_ids(doc: MapDocument) -> list[str]:
                 for x in v if isinstance(v, list) else [v]:
                     t = (u32(x.id) if isinstance(x, (Handle,)) or (isinstance(x, Ref) and x.obj is None)
                          else u32(x.link) if isinstance(x, Ptr) and x.obj is None and x.link is not None else None)
-                    if t is not None and t >> 24 == ID_RANGE_BASE >> 24:
+                    if t is not None and is_editor_id(t):
                         links.append((u, t))
     known = set(owner) | set(doc.info)
     out += [f"ids: {doc.name_of(u)} links to {t:#x}, which doesn't exist" for u, t in links if t not in known]

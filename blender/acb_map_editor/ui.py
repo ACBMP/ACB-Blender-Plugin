@@ -77,6 +77,9 @@ class ACB_OT_open_map(bpy.types.Operator):
         finally:
             wm.progress_end()
         n = len(s.objects)
+        if s.migrated:
+            self.report({"WARNING"}, f"renumbered {s.migrated} object ids an earlier editor version put in the "
+                                     "engine's runtime range (those objects never showed in game); save to keep it")
         self.report({"INFO"}, f"{os.path.basename(self.filepath)}: {n} editable objects")
         return {"FINISHED"}
 
@@ -368,6 +371,36 @@ class ACB_OT_replace_visual(bpy.types.Operator):
         bpy.data.objects.remove(src[0])
         s.snapshot()
         self.report({"INFO"}, f"{el.name}: new visual mesh")
+        return {"FINISHED"}
+
+
+class ACB_OT_edit_boundary(bpy.types.Operator):
+    """Edit the out-of-bounds boundary: selects its wall object and enters Edit Mode (G moves corners, E extends
+    from a selected corner, subdivide adds one, X > Dissolve Vertices removes one); Apply regenerates the wall"""
+    bl_idname = "acb.edit_boundary"
+    bl_label = "Edit Boundary"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        s = sess(context)
+        walls = [o for o in context.scene.objects if o.get("acb_part") == "oobwall"]
+        if not walls:
+            self.report({"ERROR"}, "this map has no out-of-bounds wall")
+            return {"CANCELLED"}
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        for o in context.selected_objects:
+            o.select_set(False)
+        wob = walls[0]
+        if s is not None:
+            s.set_collection_visible("Out of Bounds", True)
+        wob.hide_set(False)
+        wob.hide_select = False
+        wob.select_set(True)
+        context.view_layer.objects.active = wob
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_mode(type="VERT")
+        self.report({"INFO"}, "boundary in Edit Mode: G move, E extend, X > Dissolve Vertices remove; then Apply")
         return {"FINISHED"}
 
 
@@ -702,6 +735,7 @@ class ACB_PT_tools(ACBPanel, bpy.types.Panel):
         vis = s.collision_visible() if (s := sess(context)) is not None else True
         col.operator("acb.toggle_collision", text="Hide Collision" if vis else "Show Collision",
                      icon="HIDE_OFF" if vis else "HIDE_ON")
+        col.operator("acb.edit_boundary", icon="EDITMODE_HLT")
         col.operator("acb.clear_scenery", icon="TRASH")
         col.operator("acb.new_collision", icon="MESH_CUBE")
         col.operator("acb.new_scenery", icon="SCENE_DATA")
@@ -798,7 +832,7 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
 
 
 CLASSES = (ACB_OT_open_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
-           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
+           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_edit_boundary, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
            ACB_OT_strip_guidance,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_add_selected, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,

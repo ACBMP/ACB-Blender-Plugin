@@ -157,3 +157,32 @@ def test_delete_many_matches_delete(tmp_path):
     assert all(v is None for v in res.values())
     d2 = reopen(d, tmp_path)
     assert count(d2, "spawn") == n - 5
+
+
+def test_new_ids_avoid_engine_runtime_range(tmp_path):
+    """Objects the engine creates at runtime are numbered from 0xF0000000 (ObjectManager): a forge object there
+    never shows up. Copies get editor-range ids, and older saves with runtime-range ids are renumbered."""
+    d = MapDocument(MAP)
+    sp = first(d, "spawn")
+    nk = ops.duplicate(d, sp.key)
+    from anvilforge.fastload import walk
+    ids = [u32(o.id) for o in walk(ops.element_obj(d, nk))]
+    assert all(ops.is_editor_id(i) for i in ids if i)
+    # simulate an old save: move the copy into the runtime range, then migrate
+    old = {i: 0xF00F0000 + k for k, i in enumerate(sorted(set(ids) - {0}))}
+    r = d.root(nk[0])
+    ops._remap_ids(r.obj, old)
+    for b in d.uids("GridCellDataBlock"):
+        o = d.obj(b)
+        if any(u32(x.id) == nk[0] for x in o.fields["Objects"]):
+            ops._remap_ids(o, old)
+            d.touch(b)
+    fn, pos = d.where[nk[0]][0]
+    d.remove_root(nk[0])
+    d.add_root(fn, r, "old_copy", pos)
+    assert ops.migrate_runtime_ids(d) == len(old)
+    d2 = reopen(d, tmp_path)
+    assert not [u for u in d2.info if u >= ops.RUNTIME_ID_BASE]
+    assert count(d2, "spawn") == count(MapDocument(MAP), "spawn") + 1
+    from acbmap.checks import new_problems
+    assert new_problems(d2, MapDocument(MAP)) == []

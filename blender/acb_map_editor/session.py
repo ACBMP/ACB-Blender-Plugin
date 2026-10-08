@@ -178,6 +178,9 @@ class Session:
         self.scene = scene
         self.root_coll_name = None
         self.doc = MapDocument(forge_path)
+        self.migrated = 0
+        if any(u >= ops.RUNTIME_ID_BASE for u in self.doc.info):   # saved by an editor version before the fix
+            self.migrated = ops.migrate_runtime_ids(self.doc)
         self.source = forge_path
         self.multi_dir = multi_dir or os.path.dirname(forge_path)
         self.wd = WorldData(self.doc, self.multi_dir)

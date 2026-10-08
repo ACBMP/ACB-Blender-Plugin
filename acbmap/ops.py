@@ -5,7 +5,10 @@ Engine rules these follow (acr-map-port NOTES.md):
 - A root is loaded only when a GridCellDataBlock lists it in the first NumberOfObjectsToActivate entries of Objects,
   and it must live in that block's own entry (blockcheck rule).
 - Entity.GlobalMatrix is world space for roots and group children alike; component zones/shapes are entity-local.
-- New ids come from a reserved range (0xF0xxxxxx is unused by every ACB multi forge), one 64k slice per world.
+- New ids come from 0xE9600000-0xEAA00000, a run of 64k slices no ACB multi forge (retail, skins, extra, the ACFE
+  ports) uses, one slice per world. NOT 0xF0000000 and up: the engine numbers runtime-created objects from there
+  (scimitar::ObjectManager: transient ids from 0xF0000000, local ids from 0xF8000000), and a forge object whose id
+  a runtime object already took never shows up in game.
 """
 from __future__ import annotations
 
@@ -19,7 +22,13 @@ from .geom import matrix_rows, pack_floats
 from .kinds import group_children
 from .schema import type_name
 
-ID_RANGE_BASE = 0xF0000000
+ID_RANGE_LO, ID_RANGE_HI = 0xE9600000, 0xEAA00000   # free in every multi forge (census 2026-10-08)
+ID_RANGE_BASE = ID_RANGE_LO
+RUNTIME_ID_BASE = 0xF0000000                         # ObjectManager transient/local ids: never use in a forge
+
+
+def is_editor_id(i: int) -> bool:
+    return ID_RANGE_LO <= i < ID_RANGE_HI
 
 
 class EditError(Exception):
@@ -31,7 +40,8 @@ class EditError(Exception):
 def id_base(doc: MapDocument) -> int:
     worlds = doc.uids("World")
     w = worlds[0] if worlds else 0
-    return ID_RANGE_BASE | ((((w * 2654435761) & 0xFFFFFFFF) >> 8 & 0xFF) << 16)
+    n = (ID_RANGE_HI - ID_RANGE_LO) >> 16
+    return ID_RANGE_LO + ((((w * 2654435761) & 0xFFFFFFFF) >> 8) % n << 16)
 
 
 def all_ids(doc: MapDocument) -> set[int]:
@@ -60,6 +70,36 @@ def fresh_ids(doc: MapDocument, n: int) -> list[int]:
         i += n
         if i + n > base + 0x10000:
             raise EditError("this world's id range is exhausted")
+
+
+def migrate_runtime_ids(doc: MapDocument) -> int:
+    """Renumber objects an earlier editor version gave ids in the engine's runtime range (>= 0xF0000000) into the
+    editor range, with every link to them. Returns the number of ids changed."""
+    roots = [u for u in doc.info if doc.root(u) is not None]
+    bad = set()
+    for u in roots:
+        for o in walk(doc.obj(u)):
+            if u32(o.id) >= RUNTIME_ID_BASE:
+                bad.add(u32(o.id))
+    if not bad:
+        return 0
+    mapping = dict(zip(sorted(bad), fresh_ids(doc, len(bad))))
+    for u in roots:
+        r = doc.root(u)
+        if not (linked_ids(r.obj) & bad or any(u32(o.id) in bad for o in walk(r.obj))):
+            continue
+        _remap_ids(r.obj, mapping)
+        if u in mapping:   # the root itself: re-add under its new id, in place
+            fn = doc.entry_of(u)
+            pos = next(i for f, i in doc.where[u] if f == fn)
+            name = doc.name_of(u)
+            doc.remove_root(u)
+            doc.add_root(fn, r, name, pos)
+        else:
+            doc.touch(u)
+    if hasattr(doc, "_compounds"):
+        doc._compounds = None
+    return len(mapping)
 
 
 # ------------------------------------------------------------------ access --

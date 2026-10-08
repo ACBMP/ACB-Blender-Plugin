@@ -106,8 +106,10 @@ acbmap install <forge> | uninstall <name> | status
 - Only touched roots are re-encoded and only their entries rebuilt; everything else is byte-identical. Entries
   are laid out retail-style, so no header straddles a 0x8000 streaming chunk.
 - New roots go into their source's grid-cell entry, inside the block's activated prefix
-  (`NumberOfObjectsToActivate`). New ids come from 0xF0xxxxxx, one 64k slice per world; no ACB forge uses that
-  range.
+  (`NumberOfObjectsToActivate`). New ids come from 0xE9600000-0xEAA00000, one 64k
+  slice per world, a run no ACB multi forge uses. Never 0xF0000000 and up: the engine numbers the objects it
+  creates at runtime from there, and a forge object with such an id never appears in game (maps saved by
+  earlier editor versions are renumbered when opened).
 - Escort paths and chest points are written as an AdditionalWorldData override entry in the map forge, under the
   skins table's id. The skins forges are never edited. Chest data is regenerated from the map's chest spawns,
   with phantom twins exactly as retail has them.
