@@ -608,20 +608,37 @@ HOLLOW_COMPONENTS = {"Visual", "InertComponent", "MultiInertComponent", "Guidanc
 COLLAPSED_SHAPE = ([(0.0, 0.0, -500.0), (0.01, 0.0, -500.0), (0.0, 0.01, -500.0)], [(0, 1, 2)], [0])
 
 
-def hollow(doc: MapDocument, uid: int, keep_collision: bool = True) -> None:
-    """Strip an element (and a group's children) of what makes it seen, solid or climbable, keeping the entity, its
-    other components and its place in its block: for elements something unchangeable still names (a navmesh's
-    source entity may be asked for its rigid body). keep_collision: the InertComponents stay, each with its own
-    MeshShape collapsed to a 1 cm triangle 500 m below; otherwise they go too."""
-    from .geom import set_mesh_shape_geometry
+PARK_DEPTH = 1000.0   # parked elements sit this far below where they were
+
+
+def hollow(doc: MapDocument, uid: int, keep_collision: bool = True, mode: str = "park") -> None:
+    """Get an element that something unchangeable still names (a navmesh's source entity, a bench it links) out of
+    the way without deleting it. Modes (in-game 2026-10-08: removing Visual + collision + climb edges from them
+    crashed the load; leaving them intact loaded):
+      park     the element (a group with its children) moved PARK_DEPTH m down, untouched otherwise
+      visual   Visual and GuidanceSystem removed, collision left as is
+      shape    each MeshShape collapsed to a 1 cm triangle 500 m below, Visual kept
+      strip    Visual and GuidanceSystem removed; collision collapsed (keep_collision) or removed"""
+    from .geom import position, set_mesh_shape_geometry, set_position
     o = doc.obj(uid)
     is_group = type_name(o.type_hash) == "EntityGroup"
+    for x in [o] + (group_children(o) if is_group else []):
+        unmerge(x)   # its compound (if any) goes with the cleared scenery
+    if mode == "park":
+        m = o.fields["GlobalMatrix"]
+        x, y, z = position(m)
+        set_matrix(doc, (uid, -1), set_position(m, (x, y, z - PARK_DEPTH)))
+        doc.touch(uid)
+        return
     for ci, x in [(-1, o)] + (list(enumerate(group_children(o))) if is_group else []):
-        drop = HOLLOW_COMPONENTS - ({"InertComponent"} if keep_collision else set())
-        x.fields["Components"] = [p for p in x.fields.get("Components", [])
-                                  if not (isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) in drop)]
-        if keep_collision:
-            unmerge(x)   # its compound (if any) goes with the cleared scenery
+        if mode in ("visual", "strip"):
+            drop = {"Visual", "GuidanceSystem"}
+            if mode == "strip" and not keep_collision:
+                drop |= {"InertComponent", "MultiInertComponent"}
+            x.fields["Components"] = [p for p in x.fields.get("Components", [])
+                                      if not (isinstance(p, Ptr) and p.obj is not None
+                                              and type_name(p.obj.type_hash) in drop)]
+        if mode == "shape" or (mode == "strip" and keep_collision):
             for k, (_i, ic) in enumerate(inert_components(x)):
                 sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
                 if sid not in doc.info or doc.type_of(sid) != "MeshShape":
@@ -636,7 +653,8 @@ SCENERY_KINDS = {"visual", "collision"}
 
 
 def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = True,
-                  blank_fakes: bool = False) -> dict:
+                  blank_fakes: bool = False, hollow_pinned: bool = True, prune_deps: bool = True,
+                  hollow_mode: str = "park") -> dict:
     """Start a new map from this one: remove every element of `kinds` (default: visible geometry and static
     collision) and every group made only of them, keeping gameplay (spawns, chests, benches, chase breakers, zones,
     out-of-bounds, crowd flows...). Elements something else still links to are kept, and so are elements no grid
@@ -683,6 +701,8 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = 
     pinned = opaque_references(doc)
     hollowed = {u for u in gone if any(u32(o.id) in pinned for o in walk(doc.obj(u)))}
     gone -= hollowed
+    if not hollow_pinned:   # diagnostic: what the navmesh names stays as it is
+        hollowed = set()
     # what new collision/scenery/climb edges are cloned from stays, but in no block: never added to the world
     templates = set(template_roots(doc, exclude=hollowed)) & gone
     gone -= templates
@@ -706,7 +726,7 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = 
     for u in gone:
         by_entry.setdefault(doc.entry_of(u), set()).add(u)
     dropped = 0
-    for fn, us in by_entry.items():
+    for fn, us in (by_entry.items() if prune_deps else ()):
         lost, still = set(), set()
         for sub in doc._file(fn).subs:
             v = DataFile.uid(sub[2])
@@ -725,7 +745,7 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS, keep_collision: bool = 
     _remove_from_blocks(doc, gone | templates)
     doc.remove_roots(gone)
     for u in hollowed:
-        hollow(doc, u, keep_collision)
+        hollow(doc, u, keep_collision, hollow_mode)
     for t in templates:
         if unmerge(doc.obj(t)):
             doc.touch(t)

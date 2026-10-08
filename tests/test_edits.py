@@ -6,7 +6,7 @@ import pytest
 from acbmap import ops
 from acbmap.doc import MapDocument, u32
 from acbmap.geom import mesh_shape_geometry, position, set_mesh_shape_geometry, set_position
-from acbmap.kinds import classify, component, group_children
+from acbmap.kinds import classify, component, components, group_children
 from acbmap.worlddata import WorldData
 
 MULTI = os.environ.get("ACB_MULTI", "/home/a/vbox/Assassin's Creed Brotherhood/multi")
@@ -175,13 +175,14 @@ def test_clear_scenery(tmp_path):
     assert r["hollowed"] and all(u in d2.info for u in r["hollowed"])
     gone = set(MapDocument(MAP).info) - set(d2.info)
     assert not gone & pinned
-    hollowed = [e for e in classify(d2) if e.uid in set(r["hollowed"])]
-    assert not any(n == "Visual" for e in hollowed for n in e.components)
-    for e in hollowed:   # collision kept (the navmesh may ask for the rigid body), shapes collapsed out of the way
-        for _i, ic in ops.inert_components(e.obj):
-            sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
-            if d2.type_of(sid) == "MeshShape":
-                assert max(v[2] for v in mesh_shape_geometry(d2.obj(sid))[0]) < -499
+    # parked, not stripped: intact, PARK_DEPTH below (the game crashes loading navmesh-named elements without their
+    # visual/collision)
+    src = MapDocument(MAP)
+    for u in r["hollowed"]:
+        before, after = ops.element_obj(src, (u, -1)), ops.element_obj(d2, (u, -1))
+        assert position(after.fields["GlobalMatrix"])[2] == pytest.approx(
+            position(before.fields["GlobalMatrix"])[2] - ops.PARK_DEPTH, abs=1e-3)
+        assert [n for n, _ in components(after)] == [n for n, _ in components(before)]
     assert not set(r["templates"]) & set(active) and nk[0] in active
     assert not ops.compounds(d2)
     from acbmap.checks import new_problems
