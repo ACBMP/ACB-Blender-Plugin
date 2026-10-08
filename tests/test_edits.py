@@ -126,8 +126,9 @@ def test_delete_many(tmp_path):
     g = next(e for e in classify(d, False) if len(group_children(e.obj)) >= 3)
     names = [u32(c.id) for c in group_children(g.obj)]
     spawn = first(d, "spawn").uid
-    done, refused = ops.delete_many(d, [(g.uid, 0), (g.uid, 2), (spawn, -1), (flow, -1)])
-    assert set(done) == {(g.uid, 0), (g.uid, 2), (spawn, -1)} and list(refused) == [(flow, -1)]
+    res = ops.delete_many(d, [(g.uid, 0), (g.uid, 2), (spawn, -1), (flow, -1)])
+    assert {k for k, why in res.items() if why is None} == {(g.uid, 0), (g.uid, 2), (spawn, -1)}
+    assert res[(flow, -1)] is not None
     d2 = reopen(d, tmp_path)
     left = [u32(c.id) for c in group_children(d2.obj(g.uid))]
     assert left == [names[1]] + names[3:]
