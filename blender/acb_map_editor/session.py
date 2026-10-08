@@ -149,8 +149,31 @@ def get(scene) -> "Session | None":
 
 
 class Session:
+    # Blender structs are looked up by name on every use: a stored Scene/Collection reference goes stale ("StructRNA
+    # of type Scene has been removed") whenever Blender rebuilds its data, e.g. on undo.
+    @property
+    def scene(self):
+        sc = bpy.data.scenes.get(self.scene_name)
+        if sc is None:
+            raise RuntimeError(f"scene {self.scene_name!r} no longer exists; reopen the map")
+        return sc
+
+    @scene.setter
+    def scene(self, sc):
+        self.scene_name = sc.name
+
+    @property
+    def root_coll(self):
+        c = bpy.data.collections.get(self.root_coll_name) if self.root_coll_name else None
+        return c if c is not None else self.scene.collection
+
+    @root_coll.setter
+    def root_coll(self, c):
+        self.root_coll_name = None if c is None or c == self.scene.collection else c.name
+
     def __init__(self, scene, forge_path: str, multi_dir: str | None = None):
         self.scene = scene
+        self.root_coll_name = None
         self.doc = MapDocument(forge_path)
         self.source = forge_path
         self.multi_dir = multi_dir or os.path.dirname(forge_path)
@@ -189,10 +212,11 @@ class Session:
             self.tag = f"{base} {self.scene.name}" + (f" {i}" if i > 1 else "")
             i += 1
         self.scene["acb_tag"] = self.tag
-        self.root_coll = bpy.data.collections.get(f"ACB {self.tag}")
-        if self.root_coll is None:
-            self.root_coll = bpy.data.collections.new(f"ACB {self.tag}")
-            self.scene.collection.children.link(self.root_coll)
+        rc = bpy.data.collections.get(f"ACB {self.tag}")
+        if rc is None:
+            rc = bpy.data.collections.new(f"ACB {self.tag}")
+            self.scene.collection.children.link(rc)
+        self.root_coll = rc
         elements = classify(self.doc)
         roots_obj: dict[int, bpy.types.Object] = {}
         n = len(elements)
