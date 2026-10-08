@@ -45,13 +45,24 @@ def id_base(doc: MapDocument) -> int:
 
 
 def all_ids(doc: MapDocument) -> set[int]:
-    """Every object id known in the document: roots plus every sub-object of every decodable root."""
+    """Every object id fresh_ids could hand out that the document already uses: every root id, plus each id in this
+    world's editor range (id_base) found in any root. Unedited roots are scanned as raw bytes for the range's 2-byte
+    prefix (a superset: a stray match only reserves an id), so nothing has to be decoded; edited roots, whose stored
+    bytes are stale, are walked. Cached; fresh_ids adds what it hands out."""
     if getattr(doc, "_all_ids", None) is None:
+        hi = (id_base(doc) >> 16).to_bytes(2, "little")
         ids = set(doc.info)
         for u in doc.info:
-            r = doc.root(u)
-            if r is not None:
-                ids.update(u32(o.id) for o in walk(r.obj))
+            if u in doc.dirty:
+                r = doc.root(u)
+                if r is not None:
+                    ids.update(u32(o.id) for o in walk(r.obj))
+                continue
+            b = doc.payload(u)
+            p = b.find(hi, 2)
+            while p >= 0:
+                ids.add(u32(b[p - 2:p + 2]))
+                p = b.find(hi, p + 1)
         ids.discard(0)
         doc._all_ids = ids
     return doc._all_ids
@@ -578,7 +589,9 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
     out-of-bounds, crowd flows...). Elements something else still links to are kept. The removed roots' entries
     lose the dependencies only they needed, and the World's FakeEntities (merged far-LOD stand-ins of the old
     buildings, drawn for cells that aren't loaded) draw nothing. The navmesh is not touched.
-    Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped."""
+    The few elements new geometry is cloned from (template_roots) are kept but taken out of every grid block, so the
+    game never adds them; Mesh to Collision/Scenery keep working on the cleared map.
+    Returns counts: removed, kept_referenced, compounds_dissolved, deps_dropped, and the template uids."""
     from .kinds import classify, kind_of
     roots = {}
     for e in classify(doc, with_children=False):
@@ -604,6 +617,9 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
             if i in sub_owner:
                 keep_roots.add(sub_owner[i])
     gone = set(roots) - keep_roots
+    # what new collision/scenery/climb edges are cloned from stays, but in no block: never added to the world
+    templates = set(template_roots(doc)) & gone
+    gone -= templates
     # compounds: one whose members all go goes too; one that keeps some (benches...) is dissolved
     member_root = {u32(e.obj.id): e.uid for e in classify(doc)}
     dissolved = 0
@@ -640,8 +656,11 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
             dropped += n - len(df.deps)
             doc.touched_files.add(fn)
 
-    _remove_from_blocks(doc, gone)
+    _remove_from_blocks(doc, gone | templates)
     doc.remove_roots(gone)
+    for t in templates:
+        if unmerge(doc.obj(t)):
+            doc.touch(t)
 
     for f in doc.uids("FakeEntities"):
         fo = doc.obj(f)
@@ -654,7 +673,7 @@ def clear_scenery(doc: MapDocument, kinds=SCENERY_KINDS) -> dict:
         doc.touch(f)
     if hasattr(doc, "_all_ids"):
         doc._all_ids = None
-    return {"removed": len(gone), "kept_referenced": len(set(roots) - gone),
+    return {"removed": len(gone), "kept_referenced": len(set(roots) - gone - templates), "templates": sorted(templates),
             "compounds_dissolved": dissolved, "deps_dropped": dropped}
 
 
@@ -728,6 +747,31 @@ def collision_template(doc: MapDocument):
     if best is None:
         raise EditError("no plain collision entity in this map to use as a template")
     return best[1]
+
+
+def template_roots(doc: MapDocument) -> list[int]:
+    """Root uids new geometry is cloned from: the collision template, the element holding the visual template and
+    the one holding a climb-edge template (acbmap.guidance.template_system)."""
+    from .guidance import systems, template_system
+    from .kinds import classify, components
+    out = []
+    try:
+        out.append(collision_template(doc).uid)
+    except EditError:
+        pass
+    try:
+        vt = visual_template(doc)
+        gt = template_system(doc)
+    except (EditError, ValueError):
+        vt = gt = None
+    for e in classify(doc):
+        if vt is not None and any(c is vt for _n, c in components(e.obj)):
+            out.append(e.uid)
+            vt = None
+        if gt is not None and any(g is gt for g in systems(e.obj)):
+            out.append(e.uid)
+            gt = None
+    return list(dict.fromkeys(out))
 
 
 def new_collision(doc: MapDocument, matrix: bytes, verts, tris, mats, template_key=None,

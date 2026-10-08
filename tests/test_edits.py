@@ -118,6 +118,22 @@ def test_delete_refuses_referenced(tmp_path):
         ops.delete(d, (flow, -1))
 
 
+def test_delete_many(tmp_path):
+    d = MapDocument(MAP)
+    w = WorldData(d, MULTI)
+    flow = w.vip_paths()[0][0]["flow"]
+    w.set_vip_paths(w.vip_paths())      # the override entry now references the flow entity
+    g = next(e for e in classify(d, False) if len(group_children(e.obj)) >= 3)
+    names = [u32(c.id) for c in group_children(g.obj)]
+    spawn = first(d, "spawn").uid
+    done, refused = ops.delete_many(d, [(g.uid, 0), (g.uid, 2), (spawn, -1), (flow, -1)])
+    assert set(done) == {(g.uid, 0), (g.uid, 2), (spawn, -1)} and list(refused) == [(flow, -1)]
+    d2 = reopen(d, tmp_path)
+    left = [u32(c.id) for c in group_children(d2.obj(g.uid))]
+    assert left == [names[1]] + names[3:]
+    assert spawn not in d2.info and flow in d2.info
+
+
 def test_compound_member_move_dissolves(tmp_path):
     d = MapDocument(MAP)
     comps = ops.compounds(d)
@@ -140,11 +156,22 @@ def test_clear_scenery(tmp_path):
     d = MapDocument(MAP)
     spawns = count(d, "spawn")
     r = ops.clear_scenery(d)
+    # new geometry still has its templates on the cleared map
+    cube = [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0), (0, 0, 2), (2, 0, 2), (2, 2, 2), (0, 2, 2)]
+    tris = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5), (2, 3, 7),
+            (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    m = d.obj(d.uids("Entity")[0]).fields["GlobalMatrix"]
+    nk = ops.new_collision(d, set_position(m, (1.0, 2.0, 3.0)), cube, tris, [0] * len(tris))
     d2 = reopen(d, tmp_path)
-    # collision that is part of a gameplay object (a chase breaker's frame, a hay cart) or that something links to
-    # stays; no standalone scenery collision does
-    roots = [e for e in classify(d2, with_children=False) if e.kind == "collision"]
-    assert r["removed"] > 100 and len(roots) <= r["kept_referenced"] and count(d2, "spawn") == spawns
+    assert r["removed"] > 100 and count(d2, "spawn") == spawns and r["templates"]
+    # collision left = the new cube, the never-activated templates, and parts of kept gameplay groups (chase-breaker
+    # door frames, hay carts)
+    from acbmap.kinds import block_membership
+    active = block_membership(d2)
+    roots = {e.uid for e in classify(d2) if e.kind == "collision" and e.child < 0}
+    assert roots - set(r["templates"]) == {nk[0]}
+    assert not set(r["templates"]) & set(active) and nk[0] in active
+    assert not ops.compounds(d2)
     from acbmap.checks import new_problems
     assert new_problems(d2, MapDocument(MAP)) == []
 

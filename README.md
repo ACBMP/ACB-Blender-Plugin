@@ -63,11 +63,15 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
    - **New map from an existing one:** **Clear Scenery** removes every visible mesh and static collision element
      (and the far-distance stand-ins of the old buildings), keeping spawns, chests, interactive objects, zones and
      out-of-bounds. Then import your geometry (File → Import → Wavefront OBJ / FBX), select it and use Mesh to
-     Collision, and move the spawns onto it. The map still installs over the map it came from.
+     Collision, and move the spawns onto it. The map still installs over the map it came from. New pieces go
+     into the always-loaded grid cell; the few elements new objects are cloned from stay, hidden and never loaded
+     in game. The navmesh stays the old map's.
    - Visible geometry: **Mesh to Scenery** turns a plain mesh into a visible object without collision; **Replace
      Visual** (select a plain mesh, then the element) swaps an element's visible mesh. Material slots holding one of
-     the map's materials (`ACBMat_*`, in the material list once a map is open) keep it; other slots get the map's
-     most used textured material. A mesh without a UV map gets box-projected uvs.
+     the map's materials (`ACBMat_*`, in the material list once a map is open) keep it; a slot whose Base Color
+     comes from an Image Texture gets a new map material showing that image (DXT1, resized to a power of two up to
+     1024, flat normal map, opaque); other slots get the map's most used textured material. A mesh without a UV map
+     gets box-projected uvs.
    - Climb edges (ledges and swing poles): **Show Climb Edges** draws them. **Generate Climb Edges** rebuilds the
      selected elements' edges from their collision, leaving out ledges whose hanging space another object takes or
      that sit less than the minimum drop above any floor (adjust *Min ledge depth* / *Min wall drop* / *Use

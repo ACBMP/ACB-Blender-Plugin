@@ -217,6 +217,7 @@ HANG_OUT = 0.15        # hang-space probe: this far out from the edge (m)
 HANG_DOWN = 0.3        # ... and this far below it (m)
 HANG_CLEAR = 0.1       # other objects' geometry closer than this to the probe blocks the edge (m)
 DROP_OUT = 0.25        # drop ray starts this far out from the edge (m)
+DROP_UP = 0.05         # ... and this far above it (m)
 
 
 def world_filter(edge_list: list[Edge], world, matrix: bytes, key, min_drop: float = MIN_DROP) -> list[Edge]:
@@ -235,8 +236,10 @@ def world_filter(edge_list: list[Edge], world, matrix: bytes, key, min_drop: flo
             s_ = p0 + (p1 - p0) * f
             hang = R @ (s_ + outward * HANG_OUT - np.array([0, 0, HANG_DOWN])) + t
             blocked = world.distance(hang, HANG_CLEAR, exclude_key=key) < HANG_CLEAR
-            g = world.ground_below(R @ (s_ + outward * DROP_OUT - np.array([0, 0, 0.02])) + t)
-            low = g is not None and g + 0.02 < (min_drop if e.subtype == LEDGE else POLE_MIN_DROP)
+            # the ray starts a little above the edge: a neighbour's floor flush with it (a pavement against a
+            # curb) is ground right below, not a drop down to that floor's underside
+            g = world.ground_below(R @ (s_ + outward * DROP_OUT + np.array([0, 0, DROP_UP])) + t)
+            low = g is not None and g - DROP_UP < (min_drop if e.subtype == LEDGE else POLE_MIN_DROP)
             ok += not blocked and not low
         if ok >= 2:
             out.append(e)

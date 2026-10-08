@@ -389,6 +389,35 @@ class Session:
             self._default_mat = V.default_material(self.doc)
         return self._default_mat
 
+    def material_from_image(self, mat) -> int | None:
+        """A Blender material whose Base Color comes from an Image Texture becomes a new map material showing that
+        image (power-of-two sized, at most 1024), once per image: the material is tagged acb_vis_material."""
+        import numpy as np
+        from acbmap import textures as TX
+        if not mat.use_nodes:
+            return None
+        img = next((n.image for n in mat.node_tree.nodes if n.type == "TEX_IMAGE" and n.image is not None
+                    and any(l.to_socket.name in ("Base Color", "Color") for o in n.outputs for l in o.links)), None)
+        if img is None or img.size[0] == 0:
+            return None
+        memo = self.__dict__.setdefault("_image_mats", {})
+        if img.name not in memo:
+            w, h = img.size
+            th, tw = TX.fit_size(h, w)
+            src = img
+            if (tw, th) != (w, h):
+                src = img.copy()
+                src.scale(tw, th)
+            px = np.empty(tw * th * 4, np.float32)
+            src.pixels.foreach_get(px)
+            if src is not img:
+                bpy.data.images.remove(src)
+            rgba = (np.clip(px.reshape(th, tw, 4)[::-1], 0, 1) * 255 + 0.5).astype(np.uint8)   # top row first
+            name = "ACBEdit_" + "".join(c if c.isalnum() else "_" for c in os.path.splitext(img.name)[0])
+            memo[img.name] = TX.new_material(self.doc, rgba, name)
+        mat["acb_vis_material"] = f"{memo[img.name]:08x}"
+        return memo[img.name]
+
     def mesh_input(self, ob, to_entity: Matrix) -> "V.MeshInput":
         """A Blender mesh object as encoder input in an entity's frame (to_entity: object-local -> entity-local).
         Slots holding one of the map's materials (ACBMat_*) keep it; others get the map's most used textured
@@ -401,6 +430,8 @@ class Session:
         slot_mat = []
         for slot in ob.material_slots:
             m = slot.material
+            if m is not None and "acb_vis_material" not in m:
+                self.material_from_image(m)
             slot_mat.append(int(m["acb_vis_material"], 16) if m is not None and "acb_vis_material" in m
                             else self.default_material())
         if not slot_mat:
@@ -489,10 +520,10 @@ class Session:
         e = Element(kind, key[0], o, key[1], names, ops.owning_block(self.doc, key[0]))
         return self._element_object(e, name)   # named at creation: the session maps keys to object names
 
-    def clear_scenery(self) -> dict:
+    def clear_scenery(self, kinds=ops.SCENERY_KINDS) -> dict:
         """ops.clear_scenery, then drop the Blender objects of what it removed."""
         self.sync()
-        res = ops.clear_scenery(self.doc)
+        res = ops.clear_scenery(self.doc, kinds)
         gone = [k for k in self.objects if parse_key(k.split("|")[0])[0] not in self.doc.info]
         for k in gone:
             ob = bpy.data.objects.get(self.objects.pop(k))
@@ -503,6 +534,12 @@ class Session:
                 bpy.data.objects.remove(ob)
         for me in [m for m in bpy.data.meshes if m.users == 0 and ("acb_shape" in m or m.name.startswith("ACB"))]:
             bpy.data.meshes.remove(me)
+        for t in res["templates"]:   # kept for cloning only, never added to the world: out of the way
+            ob = bpy.data.objects.get(self.objects.get(keystr((t, -1)), ""))
+            if ob is not None:
+                ob["acb_template"] = True
+                ob.hide_set(True, view_layer=self.scene.view_layers[0])   # this scene may not be the active one
+                ob.hide_render = True
         self.snapshot()
         res["blender_objects"] = len(gone)
         return res
@@ -916,6 +953,8 @@ class Session:
                     chests_changed |= kinds[k] == "chest_spawn"
                 else:
                     log.append(f"NOT deleted {name}: {why}")
+            self._renumber_children([parse_key(k) for k in removed
+                                     if res[parse_key(k)] is None and parse_key(k)[1] >= 0])
         # moves of originals, roots before group children (a group move carries its children; their own matrices
         # are then written exactly)
         items = sorted(((k, obs) for k, obs in by_key.items() if "|" not in k), key=lambda kv: parse_key(kv[0])[1])
@@ -1012,6 +1051,28 @@ class Session:
                                     for _i, ic in ops.inert_components(o)):
                 out.append(name)
         return out
+
+    def _renumber_children(self, deleted):
+        """After group children were deleted, the later children of those groups moved down: rekey their objects
+        (and parts) to the new indices."""
+        by_group: dict[int, list[int]] = {}
+        for g, i in deleted:
+            by_group.setdefault(g, []).append(i)
+        if not by_group:
+            return
+
+        def new_key(k: str) -> str:
+            ek, sep, part = k.partition("|")
+            g, i = parse_key(ek)
+            if g not in by_group or i < 0:
+                return k
+            return keystr((g, i - sum(1 for d in by_group[g] if d < i))) + sep + part
+
+        self.objects = {new_key(k): v for k, v in self.objects.items()}
+        self.baseline = {new_key(k): v for k, v in self.baseline.items()}
+        for ob in self.scene.objects:
+            if "acb_key" in ob and parse_key(ob["acb_key"])[0] in by_group:
+                ob["acb_key"] = new_key(ob["acb_key"])
 
     def _kind_of_key(self, k):
         try:

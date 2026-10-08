@@ -80,8 +80,9 @@ def kind_of(o: Obj, is_group: bool = False) -> str:
     if "MultiSpawnPlayerComponent" in names:
         msp = dict(comps)["MultiSpawnPlayerComponent"]
         return "chest_spawn" if u32(msp.fields["SpawnType"]) == 3 else "spawn"
-    if is_group and "Scene" in names and "TriggerComponent" in names and any(
-            _object_subtype(c) == 24 for c in group_children(o)):
+    if is_group and "Scene" in names and "TriggerComponent" in names:
+        # every such group in the 11 retail, 8 ACFE and Rome maps is a chase breaker (door, grill, arch, plank,
+        # railing, trap); about half have no ObjectSubType-24 door child
         return "chase_breaker"
     st = _object_subtype(o)
     if st in OBJECT_SUBTYPES:
