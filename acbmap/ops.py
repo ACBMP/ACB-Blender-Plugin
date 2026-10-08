@@ -360,6 +360,7 @@ def duplicate(doc: MapDocument, key, matrix: bytes | None = None, block: int | N
         nuid = doc.add_root(fn, Root(src_root.pre_header, src_root.status, new), _copy_name(doc, uid))
         copy_deps(doc, doc.entry_of(uid), fn, new)
         activate(doc, block, [nuid])
+        doc.touch(nuid)   # the copy is edited further by callers: re-encode it on save
         return (nuid, -1)
     if child >= 0:
         g = doc.obj(uid)
@@ -376,6 +377,7 @@ def duplicate(doc: MapDocument, key, matrix: bytes | None = None, block: int | N
     if doc.entry_of(blk) != fn:
         raise EditError("source root does not live in its block's entry")
     activate(doc, blk, [nuid])
+    doc.touch(nuid)   # the copy is edited further by callers: re-encode it on save
     return (nuid, -1)
 
 

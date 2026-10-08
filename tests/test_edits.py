@@ -249,3 +249,13 @@ def test_new_collision_surface_and_flags(tmp_path):
         assert int.from_bytes(o.fields["FakeCellIndex"], "little", signed=True) == -1
         assert o.fields["IsSmallObject"] == b"\x00" and o.fields["IsMediumObject"] == b"\x00"   # 40 m, 10 m: large
     assert not [u for u in d2.uids("CollisionMaterial") if ops.is_editor_id(u)]   # nothing copied
+
+
+def test_copy_edits_after_duplicate_are_saved(tmp_path):
+    """Changes made to a copy after duplicate() (fit_new_element, set_matrix...) reach the saved forge."""
+    d = MapDocument(MAP)
+    e = next(e for e in classify(d, with_children=False) if e.kind == "collision")
+    k = ops.duplicate(d, e.key, None, ops.top_block(d))
+    ops.fit_new_element(ops.element_obj(d, k))
+    d2 = reopen(d, tmp_path)
+    assert int.from_bytes(ops.element_obj(d2, k).fields["FakeCellIndex"], "little", signed=True) == -1
