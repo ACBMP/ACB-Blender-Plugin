@@ -147,3 +147,13 @@ def test_clear_scenery(tmp_path):
     assert r["removed"] > 100 and len(roots) <= r["kept_referenced"] and count(d2, "spawn") == spawns
     from acbmap.checks import new_problems
     assert new_problems(d2, MapDocument(MAP)) == []
+
+
+def test_delete_many_matches_delete(tmp_path):
+    d = MapDocument(MAP)
+    sp = [e for e in classify(d) if e.kind == "spawn"][:5]
+    n = count(d, "spawn")
+    res = ops.delete_many(d, [e.key for e in sp])
+    assert all(v is None for v in res.values())
+    d2 = reopen(d, tmp_path)
+    assert count(d2, "spawn") == n - 5

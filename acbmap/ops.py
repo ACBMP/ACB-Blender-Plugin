@@ -491,6 +491,44 @@ def delete(doc: MapDocument, key, force: bool = False) -> None:
     doc.remove_root(uid)
 
 
+def delete_many(doc: MapDocument, keys) -> dict:
+    """delete() for many elements with one reference scan (a scan per element is quadratic on a whole map). An
+    element something outside the batch links to is refused, as delete() would. Returns {key: None (deleted) or
+    the refusal reason}."""
+    keys = list(dict.fromkeys(keys))
+    owner: dict[int, tuple] = {}
+    for k in keys:
+        for o in walk(element_obj(doc, k)):
+            owner[u32(o.id)] = k
+    owner.pop(0, None)
+    roots = {k[0] for k in keys if k[1] < 0}
+    blocks = set(doc.uids("GridCellDataBlock"))
+    comps = compounds(doc)
+    refused: dict[tuple, str] = {}
+    for u in doc.info:
+        if u in roots or u in blocks or u in comps:
+            continue
+        r = doc.root(u)
+        if r is None:
+            continue
+        for i in linked_ids(r.obj) & owner.keys():
+            k = owner[i]
+            if k[0] != u:   # a group child may be linked from its own group
+                refused.setdefault(k, f"still referenced by {doc.name_of(u)}")
+    out = {k: refused.get(k) for k in keys}
+    go = [k for k in keys if out[k] is None]
+    ids = {i for i, k in owner.items() if out[k] is None}
+    for m in [m for m, mem in comps.items() if ids & set(mem)]:
+        dissolve_compound(doc, m)
+    for k in sorted((k for k in go if k[1] >= 0), key=lambda k: -k[1]):   # later children first: indices shift
+        del doc.obj(k[0]).fields["Entities"][k[1]]
+        doc.touch(k[0])
+    gone = {k[0] for k in go if k[1] < 0}
+    _remove_from_blocks(doc, gone)
+    doc.remove_roots(gone)
+    return out
+
+
 SCENERY_KINDS = {"visual", "collision"}
 
 

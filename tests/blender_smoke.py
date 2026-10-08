@@ -105,7 +105,8 @@ grid = plain(bpy.ops.mesh.primitive_grid_add, base + Vector((0, 0, 30)), x_subdi
              size=150)
 grid_name, grid_tris = grid.name, 2 * len(grid.data.polygons)
 res_big = bpy.ops.acb.new_collision(climb=False)
-pieces = [o for o in bpy.context.scene.objects if o.name.startswith(grid_name + "_col") and "acb_key" in o]
+pieces = [o for o in bpy.context.scene.objects
+          if o.name.startswith(grid_name + "_col") and "acb_key" in o and not o.get("acb_part")]
 print("SMOKE big import", res_big, len(pieces), "pieces")
 col_key, scn_key = vis_col["acb_key"], scn["acb_key"]
 climb_drawn = bpy.data.objects.get(f"{climb_el.name}:climb")
@@ -180,6 +181,7 @@ print("SMOKE clear", r, "problems", probs2)
 check(r["removed"] > 100 and not any(e.kind == "collision" for e in els2) and not O.compounds(d2),
       "clear scenery removed the collision and every compound")
 check({k: sum(1 for e in els2 if e.kind == k) for k in n_before} == n_before, f"gameplay kept {n_before}")
-check(not [o for o in sc2.objects if o.get("acb_kind") == "collision"], "Blender collision objects removed")
+check(not [o for o in sc2.objects if o.get("acb_kind") == "collision" and not o.get("acb_part")
+           and S.parse_key(o["acb_key"])[1] < 0], "Blender collision objects removed (parts of kept groups stay)")
 check(not probs2, "no new structural problems after clearing")
 print("SMOKE RESULT", "PASS" if ok else "FAIL")

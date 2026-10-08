@@ -180,7 +180,15 @@ class Session:
     def build(self, with_collision=True, with_visuals=True, progress=None):
         self.with_collision = with_collision
         self.with_visuals = with_visuals
-        self.tag = os.path.basename(self.source).replace("DataPC_", "").replace(".forge", "")
+        self.tag = base = os.path.basename(self.source).replace("DataPC_", "").replace(".forge", "")
+        i = 1
+        while True:   # collection names are global: a map open in another scene gets its own set here
+            c = bpy.data.collections.get(f"ACB {self.tag}")
+            if c is None or c.name in self.scene.collection.children:
+                break
+            self.tag = f"{base} {self.scene.name}" + (f" {i}" if i > 1 else "")
+            i += 1
+        self.scene["acb_tag"] = self.tag
         self.root_coll = bpy.data.collections.get(f"ACB {self.tag}")
         if self.root_coll is None:
             self.root_coll = bpy.data.collections.new(f"ACB {self.tag}")
@@ -718,7 +726,7 @@ class Session:
         """Rebind to the ACB objects already in the scene (a reopened .blend). Element baselines come from the
         document, so Blender edits not yet applied before the .blend was saved are still picked up; zone/section
         baselines are taken from the scene as it is."""
-        self.tag = os.path.basename(self.source).replace("DataPC_", "").replace(".forge", "")
+        self.tag = self.scene.get("acb_tag") or os.path.basename(self.source).replace("DataPC_", "").replace(".forge", "")
         self.root_coll = bpy.data.collections.get(f"ACB {self.tag}") or self.scene.collection
         for ob in self.scene.objects:
             if "acb_key" not in ob:
@@ -783,19 +791,19 @@ class Session:
                 by_key.setdefault(ob["acb_key"] + ("|" + ob["acb_part"] if ob.get("acb_part") else ""), []).append(ob)
         chests_changed = False
         # deletions (elements only; parts follow their element)
-        for k, name in list(self.objects.items()):
-            if "|" in k or k in by_key:
-                continue
-            key = parse_key(k)
-            kind = self._kind_of_key(k)
-            try:
-                ops.delete(doc, key)
-                log.append(f"deleted {name}")
-                chests_changed |= kind == "chest_spawn"
-            except ops.EditError as ex:
-                log.append(f"NOT deleted {name}: {ex}")
-            del self.objects[k]
-            self.baseline.pop(k, None)
+        removed = [k for k in self.objects if "|" not in k and k not in by_key]
+        if removed:
+            kinds = {k: self._kind_of_key(k) for k in removed}
+            res = ops.delete_many(doc, [parse_key(k) for k in removed])
+            for k in removed:
+                why = res[parse_key(k)]
+                name = self.objects.pop(k)
+                self.baseline.pop(k, None)
+                if why is None:
+                    log.append(f"deleted {name}")
+                    chests_changed |= kinds[k] == "chest_spawn"
+                else:
+                    log.append(f"NOT deleted {name}: {why}")
         # moves of originals, roots before group children (a group move carries its children; their own matrices
         # are then written exactly)
         items = sorted(((k, obs) for k, obs in by_key.items() if "|" not in k), key=lambda kv: parse_key(kv[0])[1])
