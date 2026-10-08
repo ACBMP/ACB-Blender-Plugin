@@ -114,3 +114,16 @@ def test_world_filter():
     assert len(G.world_filter(el, StubWorld(floor_z=0.0), ident, None)) == 4          # 2 m drop: fine
     assert G.world_filter(el, StubWorld(floor_z=1.9), ident, None) == []              # a floor 10 cm below
     assert G.world_filter(el, StubWorld(other=0.02), ident, None) == []               # hang space taken
+
+
+@needs_map
+def test_built_systems_are_active():
+    """Static buildings' systems are all Active; some elevators' aren't (the game ignores those edges until the
+    elevator runs). Edges the editor writes must be active whatever system they were cloned from."""
+    d = MapDocument(MAP)
+    inactive = [g for e in classify(d, with_children=False) for g in G.systems(e.obj)
+                if g.fields["Active"] == b"\x00" and g.fields["GuidanceObjects"]]
+    assert inactive, "expected an inactive retail system (elevator) to clone from"
+    ng = G.build_system(inactive[0], G.edges(inactive[0]), [0xF0FFFFF0, 0xF0FFFFF1])
+    assert ng.fields["Active"] == b"\x01"
+    assert G.template_system(d).fields["Active"] == b"\x01"

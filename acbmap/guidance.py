@@ -316,6 +316,7 @@ def build_system(template: Obj, edge_list: list[Edge], new_ids: list[int]) -> Ob
     new_ids: two unused object ids, for the system and its Partitioner (the only sub-objects with ids)."""
     g = copy.deepcopy(template)
     g.id = idb(new_ids[0])
+    g.fields["Active"] = b"\x01"   # elevators' systems start inactive (switched on at runtime); static ones never
     g.fields["Partitioner"].obj.id = idb(new_ids[1])
     pts: dict[tuple, int] = {}
     order: list[tuple] = []
@@ -367,9 +368,10 @@ def _all_nodes(g: Obj):
 
 
 def template_system(doc: MapDocument, exclude=frozenset()) -> Obj:
-    """A retail GuidanceSystem of this map with a single-leaf partitioner and ledge edges, to clone from."""
+    """A retail GuidanceSystem of this map with a single-leaf partitioner and ledge edges, to clone from: a static
+    building's (an elevator's may be inactive, so the game ignores its edges until it runs)."""
     from .kinds import classify
-    for e in classify(doc, with_children=False):
+    for e in sorted(classify(doc, with_children=False), key=lambda e: e.kind != "collision"):
         if e.uid in exclude:
             continue
         for g in systems(e.obj):
