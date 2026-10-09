@@ -6,7 +6,7 @@ import pytest
 
 from acbmap import guidance as G, ops
 from acbmap.checks import new_problems
-from acbmap.doc import MapDocument
+from acbmap.doc import MapDocument, u32
 from acbmap.kinds import classify
 
 MULTI = os.environ.get("ACB_MULTI", "/home/a/vbox/Assassin's Creed Brotherhood/multi")
@@ -58,6 +58,11 @@ def test_writer_reproduces_retail():
             for a, b, x, y in zip(el, G.edges(ng), g.fields["GuidanceObjects"], ng.fields["GuidanceObjects"]):
                 assert math.dist(a.p0, b.p0) < 1e-3 and math.dist(a.p1, b.p1) < 1e-3
                 assert x.fields == y.fields | {"Index0": x.fields["Index0"], "Index1": x.fields["Index1"]}
+            # the stored values themselves, not just what this module decodes them to: the game reads them
+            used = {u32(x.fields[k]) for x in g.fields["GuidanceObjects"] for k in ("Index0", "Index1")}
+            cp = g.fields["CompressPoints"]
+            assert set(b"".join(ng.fields["CompressPoints"])[i:i + 6] for i in range(0, len(ng.fields["CompressPoints"]) * 2, 6)) \
+                == {b"".join(cp[3 * i:3 * i + 3]) for i in used}
             n += 1
     assert n > 100
 
@@ -127,3 +132,21 @@ def test_built_systems_are_active():
     ng = G.build_system(inactive[0], G.edges(inactive[0]), [0xF0FFFFF0, 0xF0FFFFF1])
     assert ng.fields["Active"] == b"\x01"
     assert G.template_system(d).fields["Active"] == b"\x01"
+
+
+@needs_map
+def test_points_fill_their_box():
+    """CompressPoints are a 5 mm grid (offset binary), not normalized into the Partitioner box: decoded so, the box is
+    the points' bounds (its Max is sometimes padded, its Min never)."""
+    import struct
+    d = MapDocument(MAP)
+    fit = n = 0
+    for e in classify(d, with_children=False):
+        for g in G.systems(e.obj):
+            pts = G.points(g)
+            if not pts:
+                continue
+            lo = struct.unpack("<3f", g.fields["Partitioner"].obj.fields["Min"])
+            fit += all(abs(lo[k] - min(p[k] for p in pts)) < 0.006 for k in range(3))
+            n += 1
+    assert n > 100 and fit / n > 0.9

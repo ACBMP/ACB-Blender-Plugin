@@ -8,8 +8,11 @@ Layout (inferred from the retail maps; every field below round-trips through fas
   the top, not the wall's outward normal. Retail stores both orders (56% top first), so the game tells them apart
   itself. Poles are thin bars (retail: 2 m x 10 cm x 30 cm) with one pole edge along each top long edge, each
   pointing inward across the bar.
-- CompressPoints: int16 x,y,z per point, signed-normalized into the Partitioner's Min/Max box:
-  p = min + (q / 32767 + 1) / 2 * (max - min). Entity-local, like the collision shapes.
+- CompressPoints: x,y,z per point on a fixed 5 mm grid, offset binary: u16 = floor(p / 0.005) + 32768 (so +-163 m,
+  entity-local like the collision shapes). 99.5% of retail points decode onto their collision mesh edges. The
+  Partitioner's Min/Max is just the points' bounds (the float points, so 0-5 mm off the grid); it is not used to
+  decode -- reading the values as normalized into that box, as this module did at first, only matches when the box is
+  left as is, and in game every rewrite with another box lost its ledges.
 - Partitioner: a tree over the edges, nodes stored children first with the root last (RootIndex). NodeType 0 is a
   leaf, [Index0, Index1) a range of LeafsIndex (edge indices); NodeTypes 1-3 split, Index0/Index1 child nodes
   (65535 = none), Middle the split value. 95% of retail systems are one leaf, up to 173 edges; that is what the
@@ -51,6 +54,7 @@ POLE_MAX_DROP = 0.5    # ... if its sides are a bar's thickness, not a wall (m)
 POLE_MIN_DROP = 0.2    # ... and not a decorative strip (m; retail: 0.30)
 POLE_MIN_LENGTH = 0.5  # ... and long enough to swing on (m)
 MAX_EDGE_SLOPE = 0.7   # edges steeper than this (|direction z|) aren't ledges
+GRID = 0.005          # CompressPoints step (m)
 
 
 @dataclass
@@ -91,12 +95,8 @@ def systems(entity: Obj) -> list[Obj]:
 
 
 def points(g: Obj) -> list[tuple[float, float, float]]:
-    P = g.fields["Partitioner"].obj
-    lo = struct.unpack("<3f", P.fields["Min"])
-    hi = struct.unpack("<3f", P.fields["Max"])
-    q = [struct.unpack("<h", x)[0] for x in g.fields["CompressPoints"]]
-    return [tuple(lo[k] + (q[i + k] / 32767 + 1) / 2 * (hi[k] - lo[k]) for k in range(3))
-            for i in range(0, len(q) - 2, 3)]
+    q = [struct.unpack("<H", x)[0] for x in g.fields["CompressPoints"]]
+    return [tuple((q[i + k] - 32768 + 0.5) * GRID for k in range(3)) for i in range(0, len(q) - 2, 3)]
 
 
 def _dn4(b: bytes):
@@ -331,10 +331,11 @@ def build_system(template: Obj, edge_list: list[Edge], new_ids: list[int]) -> Ob
 
     def q(p):
         out = []
-        for k in range(3):
-            span = hi[k] - lo[k]
-            v = 0 if span <= 0 else round(((p[k] - lo[k]) / span * 2 - 1) * 32767)
-            out.append(struct.pack("<h", max(-32768, min(32767, v))))
+        for c in p:
+            v = math.floor(c / GRID) + 32768
+            if not 0 <= v <= 0xFFFF:
+                raise ValueError(f"climb point {p} is beyond the +-{32768 * GRID:.0f} m the format can hold")
+            out.append(struct.pack("<H", v))
         return out
     g.fields["CompressPoints"] = [b for p in order for b in q(p)]
     proto = template.fields["GuidanceObjects"][0] if template.fields["GuidanceObjects"] else None
