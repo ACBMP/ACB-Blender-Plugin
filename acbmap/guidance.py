@@ -44,8 +44,9 @@ SUBTYPE_NAMES = {1: "ledge", 2: "beam", 3: "ladder", 4: "pole", 5: "rope", 6: "s
 DEFAULT_SLOPE_COS = math.cos(math.radians(45))
 WELD = 1e-3            # vertex weld tolerance (m)
 MIN_EDGE = 0.05        # shorter generated edges are dropped (m)
-MIN_DEPTH = 0.1        # a ledge needs this much walkable surface behind it (m)
+MIN_DEPTH = 0.03       # a ledge needs this much walkable surface behind it (m; retail grabs 4 cm beam ends)
 MIN_DROP = 0.2         # and this much wall below it, or it's a step (m)
+FALL_OUT = 0.05        # the fall below an edge is measured this far out from it (m)
 REACH_CAP = 2.0        # depth/drop are measured over connected faces up to this far (m)
 STEEP_Z = 0.5          # a face with normal z below this can be the wall side of a ledge
 MERGE_COS = 0.999      # collinear and same-normal tolerance when merging edges
@@ -66,6 +67,7 @@ class Edge:
     subtype: int = LEDGE
     depth: float = 0.0     # how far the walkable face reaches back from the edge (m)
     drop: float = 0.0      # how far the wall face reaches down from the edge (m)
+    fall: float = 0.0      # how far down the own mesh lets a climber hang just outside the edge (m, up to REACH_CAP)
 
 
 # ------------------------------------------------------------------ math --
@@ -175,6 +177,32 @@ def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: floa
                     stack.append(nb)
         return min(best, REACH_CAP)
 
+    def fall_below(p, q, n_wall):
+        """Free height below a point just outside the edge: an eave or a sill's thin underside isn't the
+        whole drop, the wall it overhangs is (retail grabs those)."""
+        h = math.hypot(n_wall[0], n_wall[1]) or 1.0
+        out = (n_wall[0] / h * FALL_OUT, n_wall[1] / h * FALL_OUT)
+        best = REACH_CAP
+        zmin = min(w[2] for w in wv)
+        for f in (0.25, 0.5, 0.75):
+            x = p[0] + (q[0] - p[0]) * f + out[0]
+            y = p[1] + (q[1] - p[1]) * f + out[1]
+            z0 = p[2] + (q[2] - p[2]) * f
+            for a, b, c in faces:
+                A, B, C = wv[a], wv[b], wv[c]
+                det = (B[1] - C[1]) * (A[0] - C[0]) + (C[0] - B[0]) * (A[1] - C[1])
+                if abs(det) < 1e-12:
+                    continue
+                l1 = ((B[1] - C[1]) * (x - C[0]) + (C[0] - B[0]) * (y - C[1])) / det
+                l2 = ((C[1] - A[1]) * (x - C[0]) + (A[0] - C[0]) * (y - C[1])) / det
+                if l1 < 0 or l2 < 0 or l1 + l2 > 1:
+                    continue
+                z = l1 * A[2] + l2 * B[2] + (1 - l1 - l2) * C[2]
+                if z < z0 - 1e-3:
+                    best = min(best, z0 - z)
+            best = min(best, z0 - zmin)   # nothing below: as far as the element itself goes down (a step doesn't)
+        return best
+
     raw = []
     for (u, v), fs in adj.items():
         if len(fs) != 2:
@@ -206,8 +234,11 @@ def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: floa
         raw.append(Edge(wv[u], wv[v], n0, n1, LEDGE, depth, drop))
     merged = [e for e in _merge(raw) if math.dist(e.p0, e.p1) >= MIN_EDGE]
     poles = _find_poles(merged)
+    for i, e in enumerate(merged):
+        if i not in poles and e.depth >= min_depth and e.drop < min_drop:
+            e.fall = fall_below(e.p0, e.p1, e.n1)
     return [_oriented(e) for i, e in enumerate(merged)
-            if (i in poles and e.drop > 0) or (e.depth >= min_depth and e.drop >= min_drop)]
+            if (i in poles and e.drop > 0) or (e.depth >= min_depth and max(e.drop, e.fall) >= min_drop)]
 
 
 def _oriented(e: Edge) -> Edge:
