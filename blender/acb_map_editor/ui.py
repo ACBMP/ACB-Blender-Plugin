@@ -766,6 +766,16 @@ def _extend_path(s, path, uid) -> tuple[int, bool]:
     return len(add), ok
 
 
+def _close_path(s, path) -> tuple[int, bool]:
+    """Close the loop: append the flows leading from the path's last flow back to its first. Returns (nodes added,
+    closed)."""
+    add = F.closing(s.flow_graph, [n["flow"] for n in path])
+    if add is None:
+        return 0, False
+    path += [{"flow": u, "spawn": False, "checkpoint": False} for u in add]
+    return len(add), True
+
+
 def _toggle_stop(path, uid, what=("spawn", "checkpoint")) -> int:
     nodes = [n for n in path if n["flow"] == uid]
     if nodes:
@@ -838,6 +848,26 @@ class ACB_OT_path_add_selected(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class ACB_OT_path_close(bpy.types.Operator):
+    """Close the current Escort path's loop: add the crowd flows that lead from its last node back to its first
+    (every Escort path is a loop)"""
+    bl_idname = "acb.path_close"
+    bl_label = "Close Loop"
+
+    def execute(self, context):
+        s = sess(context)
+        p = _current_path(context)
+        if p is None:
+            return {"CANCELLED"}
+        n, ok = _close_path(s, p)
+        if not ok:
+            self.report({"WARNING"}, "no connected flows lead from the last node back to the first")
+            return {"CANCELLED"}
+        _apply_paths(s)
+        self.report({"INFO"}, f"loop closed, {n} node(s) added")
+        return {"FINISHED"}
+
+
 class ACB_OT_path_mark(bpy.types.Operator):
     """Toggle VIP spawn / checkpoint on the current path's nodes on the selected crowd flows"""
     bl_idname = "acb.path_mark"
@@ -894,8 +924,9 @@ def _pick_flow(context, s, event, max_px=24.0):
 
 class ACB_OT_path_draw(bpy.types.Operator):
     """Draw the current Escort path: click crowd flows in the viewport and the path follows the connected flows to
-    each one. Ctrl+click a node: VIP spawn + checkpoint on/off. Backspace: undo the last click. Enter, Esc or
-    right-click: done"""
+    each one. Ctrl+click a node: VIP spawn + checkpoint on/off. Backspace: undo the last click. Clicking the first
+    flow again, Enter, Esc or right-click: done, closing the loop back to the first flow (every Escort path is a
+    loop)"""
     bl_idname = "acb.path_draw"
     bl_label = "Draw Path"
 
@@ -921,10 +952,19 @@ class ACB_OT_path_draw(bpy.types.Operator):
         p = _current_path(context) or []
         self.area.header_text_set(
             f"Escort path {context.scene.acb_path_index}: {len(p)} nodes  |  click a crowd flow: extend  |  "
-            "Ctrl+click: VIP spawn + checkpoint  |  Backspace: undo  |  Enter / Esc / right-click: done")
+            "Ctrl+click: VIP spawn + checkpoint  |  Backspace: undo  |  Enter / Esc / right-click: close the loop, done")
 
     def _finish(self, context):
         self.area.header_text_set(None)
+        s, p = sess(context), _current_path(context)
+        if s is not None and p and len(p) > 1:
+            n, ok = _close_path(s, p)
+            if not ok:
+                self.report({"WARNING"}, "loop not closed: no connected flows lead from the last node back to the "
+                                         "first (red)")
+            elif n:
+                self.report({"INFO"}, f"loop closed back to the first flow, {n} node(s) added")
+            _apply_paths(s)
         return {"FINISHED"}
 
     def modal(self, context, event):
@@ -953,6 +993,8 @@ class ACB_OT_path_draw(bpy.types.Operator):
             if event.ctrl or self.ctrl:
                 if not _toggle_stop(p, uid):
                     self.report({"WARNING"}, "that flow isn't on this path")
+            elif len(p) > 1 and uid == p[0]["flow"]:   # back at the start: close the loop, done
+                return self._finish(context)
             else:
                 n, ok = _extend_path(s, p, uid)
                 if n:
@@ -1269,6 +1311,10 @@ class ACB_PT_escort(ACBPanel, bpy.types.Panel):
         lay.label(text=f"{len(p)} nodes, {nsp} VIP spawns, {ncp} checkpoints")
         if not nsp and p:
             lay.label(text="no VIP spawn node: Ctrl+click nodes while drawing", icon="ERROR")
+        if len(p) > 1 and len(p) - 1 in gaps:
+            row = lay.row()
+            row.label(text="loop not closed: last node doesn't lead back to the first", icon="ERROR")
+            row.operator("acb.path_close", icon="LOOP_BACK")
         if gaps:
             lay.label(text=f"{len(gaps)} unconnected step(s) (red): the VIP may not walk them", icon="ERROR")
         uid = _flow_of(context.active_object)
@@ -1349,7 +1395,7 @@ CLASSES = (ACB_OT_open_map, ACB_OT_close_map, ACB_OT_toggle_collision, ACB_OT_re
            ACB_OT_spawn_add, ACB_OT_spawn_set, ACB_OT_spawn_drop, ACB_OT_spawn_show,
            ACB_OT_toggle_navmesh, ACB_OT_toggle_escort, ACB_OT_edit_flow,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_reverse, ACB_OT_path_add_selected, ACB_OT_path_mark,
-           ACB_OT_path_draw, ACB_OT_path_node,
+           ACB_OT_path_close, ACB_OT_path_draw, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,
            ACB_PT_map, ACB_PT_tools, ACB_PT_spawns, ACB_PT_flows, ACB_PT_escort, ACB_PT_inspector)
 

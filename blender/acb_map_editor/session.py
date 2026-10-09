@@ -1007,7 +1007,8 @@ class Session:
             color = PATH_COLORS[pi % len(PATH_COLORS)]
             curve(f"Escort path {pi}", [F.path_points(fl, flows)], color, 0.25 if pi == cur else 0.12)
             oriented = F.oriented(fl, flows)
-            gaps = [(oriented[i][-1], oriented[i + 1][0]) for i in F.gaps(fl, flows) if oriented[i] and oriented[i + 1]]
+            nxt = lambda i: oriented[(i + 1) % len(oriented)]  # noqa: E731  (the last node's next is the first)
+            gaps = [(oriented[i][-1], nxt(i)[0]) for i in F.gaps(fl, flows) if oriented[i] and nxt(i)]
             if gaps:
                 curve(f"Escort gaps: path {pi}", gaps, (1.0, 0.0, 0.0, 1), 0.3)
             if pi != cur:

@@ -109,9 +109,12 @@ def step6():
     try:
         p = s.vip_paths[-1]
         check(len(s.vip_paths) == st["n_paths"] + 1, "one path added")
-        check([n["flow"] for n in p] == st["route"], f"path follows the connected flows ({len(p)} nodes, "
-                                                       f"{len(st['route'])} in the route)")
-        check(p and p[-1]["spawn"] and p[-1]["checkpoint"] and not p[0]["spawn"], "Ctrl+click marked the end node")
+        loop = st["loop"] = st["route"] + F.closing(s.flow_graph, st["route"])
+        check([n["flow"] for n in p] == loop, f"path follows the connected flows and Enter closed the loop "
+                                              f"({len(p)} nodes, {len(st['route'])} in the route, {len(loop)} looped)")
+        check(F.gaps(s.flow_graph, [n["flow"] for n in p]) == [], "closed loop has no gaps")
+        e = len(st["route"]) - 1
+        check(p and p[e]["spawn"] and p[e]["checkpoint"] and not p[0]["spawn"], "Ctrl+click marked the clicked node")
         win, area, region = view()
         with bpy.context.temp_override(window=win, area=area, region=region):
             # spawns: add a Team 2 spawn at the cursor, then a free-for-all one -> Chest, then drop one to the ground
@@ -159,7 +162,8 @@ def step6():
         check(st["chest_key"][0] in {int.from_bytes(x.id, "little") for x in wd.get(2).obj.fields["chestSpawnPoints"]},
               "saved: chest capture data lists the new chest")
         got = wd.vip_paths()[-1]
-        check([n["flow"] for n in got] == st["route"] and got[-1]["spawn"], "saved: drawn Escort path")
+        check([n["flow"] for n in got] == st["loop"] and got[len(st["route"]) - 1]["spawn"],
+              "saved: drawn Escort path (looped)")
     except Exception:
         import traceback
         traceback.print_exc()

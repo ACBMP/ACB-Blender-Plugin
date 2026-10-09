@@ -90,7 +90,20 @@ def test_retail_paths_are_flow_chains():
             assert ok
             rebuilt += add
         assert rebuilt == u
-        assert len(F.path_points(fl, u)) == sum(len(fl[x].points) for x in u)
+        assert F.closing(fl, u) == []   # every retail path is a loop: last flow connects back to the first
+        pts = F.path_points(fl, u)
+        assert len(pts) == sum(len(fl[x].points) for x in u) + 1 and pts[-1] == pts[0]
+
+
+def test_open_path_closes_through_flows():
+    d = MapDocument(MAP)
+    fl = F.flows(d)
+    u = [n["flow"] for n in WorldData(d).vip_paths()[0]]
+    cut = u[:-3]
+    assert F.gaps(fl, cut) == [len(cut) - 1]   # only the closing step is broken
+    add = F.closing(fl, cut)
+    assert add and len(add) <= 3
+    assert F.gaps(fl, cut + add) == [] and F.closing(fl, cut + add) == []
 
 
 def test_routed_path_saves(tmp_path):
@@ -101,7 +114,9 @@ def test_routed_path_saves(tmp_path):
     first = paths[0][0]["flow"]
     far = max(fl, key=lambda u: (F.chain(fl, first, u) is not None, len(F.chain(fl, first, u) or [])))
     route = F.chain(fl, first, far)
-    assert route and len(route) > 2 and F.gaps(fl, route) == []
+    assert route and len(route) > 2 and F.gaps(fl, route) in ([], [len(route) - 1])
+    route += F.closing(fl, route)
+    assert F.gaps(fl, route) == []
     paths.append([{"flow": u, "spawn": i == 0, "checkpoint": i == 0} for i, u in enumerate(route)])
     wd.set_vip_paths(paths)
     d2 = reopen(d, tmp_path)

@@ -3,8 +3,9 @@
 A CrowdFlow entity is a polyline (NavFlowPointsLocal, entity-local) that NPCs walk; its ends connect to other flows
 (HeadConnectingNavFlows / TailConnectingNavFlows, NavFlow entity handles; links aren't always listed on both
 sides). An Escort path is an ordered list of flows (worlddata.vip_paths): in every retail path consecutive nodes are
-connected flows, except one gap on Siena. So a path is edited as a route through this graph: pick a start and an end
-flow and the chain between them is filled in.
+connected flows, except one gap on Siena, and every path is a closed loop: its last flow connects back to its first
+(which isn't repeated at the end). So a path is edited as a route through this graph: pick a start and an end flow
+and the chain between them is filled in, and the loop is closed through the chain from the last flow to the first.
 
 The flows' own points stay read-only: each point also carries a navmesh triangle and waypoint index into the opaque
 NavMeshManager, which the editor can't rebuild.
@@ -108,20 +109,34 @@ def extend(fl: dict[int, Flow], path: list[int], target: int) -> tuple[list[int]
     return c[1:], True
 
 
+def closing(fl: dict[int, Flow], path: list[int]) -> list[int] | None:
+    """Flows to append so the path's last flow connects back to its first (closing the loop): [] when it already
+    does, None when the first flow can't be reached from the last."""
+    if len(path) < 2 or connected(fl, path[-1], path[0]):
+        return []
+    c = chain(fl, path[-1], path[0])
+    return None if c is None else c[1:-1]
+
+
 def gaps(fl: dict[int, Flow], path: list[int]) -> list[int]:
-    """Indices i where node i and node i+1 aren't connected flows."""
-    return [i for i, (a, b) in enumerate(zip(path, path[1:])) if not connected(fl, a, b)]
+    """Indices i where node i and the next one aren't connected flows; the last node's next is the first (the path
+    is a loop)."""
+    n = len(path)
+    if n < 2:
+        return []
+    return [i for i in range(n) if not connected(fl, path[i], path[(i + 1) % n])]
 
 
 def oriented(fl: dict[int, Flow], path: list[int]) -> list[list[tuple]]:
     """Each node's points in walking order: every flow is turned so that it ends at the end nearest the next node
-    (the last one so that it starts nearest the previous)."""
+    (the last node's next is the first: paths are loops)."""
     out = []
     for i, u in enumerate(path):
         pts = list(fl[u].points) if u in fl else []
         if len(pts) >= 2:
-            if i + 1 < len(path) and path[i + 1] in fl and fl[path[i + 1]].points:
-                nxt = fl[path[i + 1]].points
+            j = (i + 1) % len(path)
+            if j != i and path[j] in fl and fl[path[j]].points:
+                nxt = fl[path[j]].points
                 ends = (nxt[0], nxt[-1])
                 if min(math.dist(pts[0], e) for e in ends) < min(math.dist(pts[-1], e) for e in ends):
                     pts.reverse()
@@ -133,8 +148,10 @@ def oriented(fl: dict[int, Flow], path: list[int]) -> list[list[tuple]]:
 
 
 def path_points(fl: dict[int, Flow], path: list[int]) -> list[tuple]:
-    """The whole path as one polyline along its flows."""
+    """The whole path as one polyline along its flows, back to its start (a loop)."""
     out = []
     for pts in oriented(fl, path):
         out += pts
+    if len(path) > 1 and out:
+        out.append(out[0])
     return out

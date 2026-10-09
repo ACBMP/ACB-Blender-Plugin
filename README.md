@@ -93,13 +93,18 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      height snapped to the walkable surface) and the map's navigation data is updated with it: the point's navmesh
      triangle, its waypoint, and the waypoints NPCs use to get on and off the flow at that point. A point that isn't
      over the navmesh is refused and the line goes back. **Show Navmesh** draws the walkable surface (blue wire).
-     Flows can't be copied (a copy would share the original's navigation data).
+     The navmesh is many separate pieces on purpose: one per walkable surface per 32 m cell. Pieces that touch at a
+     cell border are joined by seam links; separate surfaces (curbs, steps, roofs, ledges) only by jump, climb and
+     drop links, so gaps between pieces in the wire are normal. Flows can't be copied (a copy would share the
+     original's navigation data).
    - **Escort Paths (VIP routes)** (panel): the routes the Escort VIP NPCs walk, made of crowd flows (the
      green-blue lines). **Draw Path**, then click flows in the viewport: each click extends the path through the
      connected flows up to the one clicked, so clicking the start and a few points along the way is enough.
-     **Ctrl+click** a node on the path to make it a VIP spawn + checkpoint, **Backspace** undoes the last click,
-     Enter / Esc / right-click finishes. The current path is drawn thick with numbered nodes (spheres = VIP
-     spawns, cones = checkpoints); red segments join flows that aren't connected (the VIP may not walk them).
+     Every Escort path is a closed loop (the last flow leads back to the first, as on every retail map): clicking
+     the first flow again, Enter, Esc or right-click finishes and closes the loop through the connected flows, and
+     **Close Loop** closes a path that isn't. **Ctrl+click** a node on the path to make it a VIP spawn +
+     checkpoint, **Backspace** undoes the last click. The current path is drawn thick with numbered nodes
+     (spheres = VIP spawns, cones = checkpoints); red segments join flows that aren't connected (the VIP may not walk them).
      The node list can also toggle spawn/checkpoint, reorder and remove nodes; **Reverse** flips the path.
      **Hide Escort Paths** (also in the NPC Paths panel) hides the path lines, which sit on the crowd flows they
      follow; Draw Path shows them again.
