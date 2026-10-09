@@ -26,9 +26,11 @@ import struct
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
+from acbmap import flows as F
 from acbmap import guidance as G
 from acbmap import oob as OOB
 from acbmap import ops
+from acbmap import spawns as SPW
 from acbmap import split as SP
 from acbmap import visual as V
 from acbmap.doc import MapDocument, u32
@@ -54,6 +56,13 @@ EMPTY_STYLE = {
 SKIP_KINDS = {"visual", "other"}      # no shape, no gameplay: imported only when they have a visual mesh
 WIRE_VISUAL_KINDS = {"out_of_bounds"}   # visual = the boundary fog wall: a wireframe child, the element stays an empty
 LOCKED_KINDS = {"crowd_flow", "nav_flow"}   # their points carry navmesh triangle refs: moving them breaks the crowd
+FLOW_KINDS = ("crowd_flow", "nav_flow")
+SPAWN_COLORS = {   # spawns.label -> marker colour
+    "Free-for-all": (0.85, 0.85, 0.85, 1), "Team 1": (0.15, 0.4, 1.0, 1), "Team 2": (1.0, 0.2, 0.15, 1),
+    "Team 3": (0.2, 0.8, 0.25, 1), "Team 4": (1.0, 0.8, 0.1, 1), "Tutorial": (0.7, 0.3, 0.9, 1),
+}
+PATH_COLORS = [(1.0, 0.55, 0.1, 1), (0.1, 0.8, 1.0, 1), (0.9, 0.2, 0.8, 1), (0.6, 1.0, 0.2, 1), (1.0, 0.95, 0.3, 1),
+               (0.5, 0.5, 1.0, 1)]
 
 SESSIONS: dict[str, "Session"] = {}
 
@@ -65,6 +74,47 @@ def keystr(key) -> str:
 def parse_key(s: str):
     a, b = s.split(":")
     return int(a, 16), int(b)
+
+
+def flat_material(name: str, color) -> "bpy.types.Material":
+    """A plain coloured material (viewport colour and base colour), shared by name."""
+    m = bpy.data.materials.get(name)
+    if m is None:
+        m = bpy.data.materials.new(name)
+        m.use_nodes = True
+        bsdf = next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is not None:
+            bsdf.inputs[0].default_value = color
+    m.diffuse_color = color
+    return m
+
+
+def spawn_marker_mesh(label: str):
+    """Marker for a player spawn: a body 1.8 m tall standing on the spawn point, with arrows at the feet and at head
+    height pointing the way the player faces (local +Y). One shared mesh per spawn kind, coloured by kind."""
+    name = f"ACB_Spawn_{label}"
+    me = bpy.data.meshes.get(name)
+    if me is not None:
+        return me
+    verts, faces = [], []
+
+    def prism(outline, z0, z1):
+        b = len(verts)
+        n = len(outline)
+        verts.extend((x, y, z0) for x, y in outline)
+        verts.extend((x, y, z1) for x, y in outline)
+        faces.append(tuple(range(b + n - 1, b - 1, -1)))
+        faces.append(tuple(range(b + n, b + 2 * n)))
+        faces.extend((b + i, b + (i + 1) % n, b + n + (i + 1) % n, b + n + i) for i in range(n))
+    prism([(0.22 * math.cos(a * math.pi / 4), 0.22 * math.sin(a * math.pi / 4)) for a in range(8)], 0.0, 1.8)
+    arrow = [(-0.12, 0.0), (0.12, 0.0), (0.12, 0.55), (0.35, 0.55), (0.0, 1.0), (-0.35, 0.55), (-0.12, 0.55)]
+    prism(arrow, 0.02, 0.08)
+    prism([(x, y + 0.1) for x, y in arrow], 1.55, 1.65)
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.materials.append(flat_material(f"ACB Spawn {label}", SPAWN_COLORS.get(label, (0.6, 0.6, 0.6, 1))))
+    me.update()
+    return me
 
 
 def mat_close(a: bytes, b: bytes, eps=1e-4) -> bool:
@@ -243,7 +293,6 @@ class Session:
                 ob.matrix_parent_inverse = roots_obj[e.uid].matrix_world.inverted()
             if e.child < 0:
                 roots_obj[e.uid] = ob
-        self._build_flow_links()
         self._build_vip_curves()
         if with_visuals:
             self.set_collision_visible(False)
@@ -298,6 +347,10 @@ class Session:
         if visuals and coll_name == "Collision":
             coll_name = "Scenery"   # the Collision collection gets hidden; the scenery itself must stay visible
         coll = self.coll(coll_name)
+        spawn_label = None
+        if e.kind == "spawn":   # one sub-collection per spawn kind, so a team's spawns can be shown on their own
+            spawn_label = SPW.label(*SPW.spawn_info(e.obj))
+            coll = self.coll(f"Spawns: {spawn_label}", parent=coll)
         if name is None:
             name = self.doc.name_of(e.uid) if e.child < 0 else f"{self.doc.name_of(e.uid)}/{e.child}"
         mw = Matrix(to_blender(e.obj.fields["GlobalMatrix"]))
@@ -306,6 +359,12 @@ class Session:
             wire_visuals, visuals = visuals, []
         if visuals:
             ob = bpy.data.objects.new(name, visuals[0])
+            shape_children = shapes
+        elif spawn_label is not None:
+            ob = bpy.data.objects.new(name, spawn_marker_mesh(spawn_label))
+            shape_children = shapes
+        elif e.kind in FLOW_KINDS and (fc := self._flow_curve(e)) is not None:
+            ob = bpy.data.objects.new(name, fc)
             shape_children = shapes
         elif e.kind == "collision" and len(shapes) == 1:
             me = self._shape_mesh(shapes[0][1])
@@ -787,47 +846,118 @@ class Session:
                 old.user_remap(new)
             bpy.data.meshes.remove(old)
 
-    def _build_flow_links(self):
-        verts, edges, idx = [], [], {}
-        for e in classify(self.doc, with_children=False):
-            if e.kind != "crowd_flow":
-                continue
-            cf = component(e.obj, "CrowdFlow")
-            m = Matrix(to_blender(e.obj.fields["GlobalMatrix"]))
-            pts = [m @ Vector(struct.unpack("<3f", p.fields["FlowPosition"][:12])) for p in cf.fields["NavFlowPointsLocal"]]
-            base = len(verts)
-            verts += pts
-            edges += [(base + i, base + i + 1) for i in range(len(pts) - 1)]
-            idx[e.uid] = (base, base + len(pts) - 1)
-        me = bpy.data.meshes.new(f"ACB_CrowdFlowLines_{self.tag}")
-        me.from_pydata([tuple(v) for v in verts], edges, [])
-        ob = bpy.data.objects.new(f"Crowd flow lines [{self.tag}]", me)
-        self.coll("Crowd Flows").objects.link(ob)
-        ob.hide_select = True
+    def _flow_curve(self, e):
+        """A crowd flow as a clickable line along its points (entity-local, so the object sits at the entity)."""
+        cf = F.flow_component(e.obj)
+        pts = [struct.unpack("<3f", p.fields["FlowPosition"][:12]) for p in cf.fields["NavFlowPointsLocal"]] if cf else []
+        if len(pts) < 2:
+            return None
+        cu = bpy.data.curves.new(f"ACB_Flow_{e.uid:08x}", "CURVE")
+        cu.dimensions = "3D"
+        cu.bevel_depth = 0.08
+        sp = cu.splines.new("POLY")
+        sp.points.add(len(pts) - 1)
+        for p, v in zip(sp.points, pts):
+            p.co = (*v, 1)
+        cu.materials.append(flat_material("ACB Crowd Flow", (0.25, 0.75, 0.65, 1)))
+        return cu
+
+    @property
+    def flow_graph(self) -> "dict[int, F.Flow]":
+        if getattr(self, "_flows", None) is None:
+            self._flows = F.flows(self.doc)
+        return self._flows
+
+    def path_index(self) -> int:
+        return getattr(self.scene, "acb_path_index", 0)
 
     def _build_vip_curves(self):
+        """Escort paths drawn along their flows (raised 0.4 m, drawn in front), the current one thicker and with a
+        labelled marker per node; connections between unconnected flows in red."""
         c = self.coll("Escort Paths")
         for ob in list(c.objects):
+            data = ob.data
             bpy.data.objects.remove(ob)
-        for pi, path in enumerate(self.vip_paths):
-            cu = bpy.data.curves.new(f"ACB_EscortPath_{pi}", "CURVE")
+            if data is not None and data.users == 0:
+                bpy.data.curves.remove(data)
+        fl = self.flow_graph
+        cur = self.path_index()
+        up = Vector((0, 0, 0.4))
+
+        def curve(name, polylines, color, depth):
+            cu = bpy.data.curves.new(name, "CURVE")
             cu.dimensions = "3D"
-            cu.bevel_depth = 0.15
-            sp = cu.splines.new("POLY")
-            pts = []
-            for n in path:
-                fo = bpy.data.objects.get(self.flow_names.get(n["flow"], ""))
-                if fo is not None:
-                    pts.append(fo.matrix_world.translation + Vector((0, 0, 1.0)))
-            if not pts:
-                continue
-            sp.points.add(len(pts) - 1)
-            for p, v in zip(sp.points, pts):
-                p.co = (*v, 1)
-            ob = bpy.data.objects.new(f"Escort path {pi}", cu)
+            cu.bevel_depth = depth
+            for pts in polylines:
+                if len(pts) < 2:
+                    continue
+                sp = cu.splines.new("POLY")
+                sp.points.add(len(pts) - 1)
+                for p, v in zip(sp.points, pts):
+                    p.co = (*(Vector(v) + up), 1)
+            cu.materials.append(flat_material(name.split(":")[0], color))
+            ob = bpy.data.objects.new(name, cu)
             c.objects.link(ob)
             ob.hide_select = True
-            ob.color = (1.0, 0.6 - 0.1 * pi, 0.1, 1)
+            ob.show_in_front = True
+            return ob
+
+        for pi, path in enumerate(self.vip_paths):
+            flows = [n["flow"] for n in path]
+            if not flows:
+                continue
+            color = PATH_COLORS[pi % len(PATH_COLORS)]
+            curve(f"Escort path {pi}", [F.path_points(fl, flows)], color, 0.25 if pi == cur else 0.12)
+            oriented = F.oriented(fl, flows)
+            gaps = [(oriented[i][-1], oriented[i + 1][0]) for i in F.gaps(fl, flows) if oriented[i] and oriented[i + 1]]
+            if gaps:
+                curve(f"Escort gaps: path {pi}", gaps, (1.0, 0.0, 0.0, 1), 0.3)
+            if pi != cur:
+                continue
+            for j, n in enumerate(path):
+                f = fl.get(n["flow"])
+                if f is None:
+                    continue
+                tags = [t for t, on in (("VIP spawn", n["spawn"]), ("checkpoint", n["checkpoint"])) if on]
+                if j == 0:
+                    tags.insert(0, "start")
+                if j == len(path) - 1:
+                    tags.append("end")
+                mk = bpy.data.objects.new(f"#{j} {f.name}" + (f" ({', '.join(tags)})" if tags else ""), None)
+                mk.empty_display_type = "SPHERE" if n["spawn"] else ("CONE" if n["checkpoint"] else "PLAIN_AXES")
+                mk.empty_display_size = 0.8 if (n["spawn"] or n["checkpoint"]) else 0.3
+                mk.location = Vector(f.middle) + Vector((0, 0, 1.2))
+                mk.show_name = True
+                mk.show_in_front = True
+                mk.hide_select = True
+                c.objects.link(mk)
+
+    def refresh_element(self, key):
+        """Rebuild an element's Blender object after its kind changed in the document (e.g. a spawn's team)."""
+        k = keystr(key)
+        old = bpy.data.objects.get(self.objects.get(k, ""))
+        name, selected, active = None, False, False
+        if old is not None:
+            name, selected = old.name, old.select_get()
+            active = bpy.context.view_layer.objects.active == old
+            for ob in [*old.children_recursive, old]:
+                bpy.data.objects.remove(ob)
+        o = ops.element_obj(self.doc, key)
+        e = Element(classify_one(self.doc, key), key[0], o, key[1], [n for n, _ in components(o)],
+                    ops.owning_block(self.doc, key[0]))
+        ob = self._element_object(e, name)
+        if ob is None:
+            return None
+        if key[1] >= 0:
+            parent = bpy.data.objects.get(self.objects.get(keystr((key[0], -1)), ""))
+            if parent is not None:
+                ob.parent = parent
+                ob.matrix_parent_inverse = parent.matrix_world.inverted()
+        self.baseline[k] = self._state(ob)
+        ob.select_set(selected)
+        if active:
+            bpy.context.view_layer.objects.active = ob
+        return ob
 
     def attach(self):
         """Rebind to the ACB objects already in the scene (a reopened .blend). Element baselines come from the
@@ -905,6 +1035,7 @@ class Session:
         # deletions (elements only; parts follow their element)
         removed = [k for k in self.objects if "|" not in k and k not in by_key]
         if removed:
+            self._flows = None
             kinds = {k: self._kind_of_key(k) for k in removed}
             res = ops.delete_many(doc, [parse_key(k) for k in removed])
             for k in removed:
@@ -945,6 +1076,7 @@ class Session:
                     continue
                 ob["acb_key"] = keystr(nk)
                 self.objects[keystr(nk)] = ob.name
+                self._flows = None
                 if ob.type == "MESH" and orig.type == "MESH" and ob.data != orig.data and "acb_shape" in orig.data:
                     # Blender copied the mesh: give the new element its own MeshShape so editing one
                     # doesn't change the other
