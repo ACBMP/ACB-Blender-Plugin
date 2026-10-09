@@ -676,6 +676,57 @@ class ACB_OT_spawn_show(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------- crowd flows --
+
+class ACB_OT_toggle_navmesh(bpy.types.Operator):
+    """Show or hide the navmesh: the surface NPCs can walk on (crowd flow points must be on it)"""
+    bl_idname = "acb.toggle_navmesh"
+    bl_label = "Show Navmesh"
+
+    def execute(self, context):
+        s = sess(context)
+        first = bpy.data.objects.get(f"Navmesh [{s.tag}]") is None
+        s.navmesh_object()
+        s.set_collection_visible("Navmesh", first or not s.collection_visible("Navmesh"))
+        return {"FINISHED"}
+
+
+class ACB_OT_toggle_escort(bpy.types.Operator):
+    """Show or hide the Escort path lines (they're drawn over the crowd flows they follow)"""
+    bl_idname = "acb.toggle_escort"
+    bl_label = "Show Escort Paths"
+
+    def execute(self, context):
+        s = sess(context)
+        s.set_collection_visible("Escort Paths", not s.collection_visible("Escort Paths"))
+        return {"FINISHED"}
+
+
+def _escort_toggle(lay, s):
+    vis = s.collection_visible("Escort Paths")
+    lay.operator("acb.toggle_escort", text="Hide Escort Paths" if vis else "Show Escort Paths",
+                 icon="HIDE_OFF" if vis else "HIDE_ON")
+
+
+class ACB_OT_edit_flow(bpy.types.Operator):
+    """Edit the active crowd flow's points (Edit Mode): G moves points, E extends from an end point, right-click >
+    Subdivide adds points between, X deletes. Apply puts them on the navmesh and updates the navigation data"""
+    bl_idname = "acb.edit_flow"
+    bl_label = "Edit Flow Points"
+
+    def execute(self, context):
+        ob = context.active_object
+        if _flow_of(ob) is None or ob.type != "CURVE":
+            self.report({"ERROR"}, "click a crowd flow (the green-blue lines) first")
+            return {"CANCELLED"}
+        for x in context.selected_objects:
+            if x != ob:
+                x.select_set(False)
+        ob.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------- escort --
 
 def _apply_paths(s):
@@ -860,6 +911,7 @@ class ACB_OT_path_draw(bpy.types.Operator):
         self.steps = []   # nodes added per click
         self.ctrl = False
         s.set_collection_visible("Crowd Flows", True)
+        s.set_collection_visible("Escort Paths", True)   # drawing a path you can't see
         self.area = context.area
         self._status(context)
         context.window_manager.modal_handler_add(self)
@@ -1146,6 +1198,42 @@ class ACB_PT_spawns(ACBPanel, bpy.types.Panel):
         lay.label(text="Players face the arrows; G moves, R Z turns")
 
 
+class ACB_PT_flows(ACBPanel, bpy.types.Panel):
+    bl_label = "NPC Paths (crowd flows)"
+    bl_parent_id = "ACB_PT_map"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return sess(context) is not None
+
+    def draw(self, context):
+        s = sess(context)
+        lay = self.layout
+        vis = bpy.data.objects.get(f"Navmesh [{s.tag}]") is not None and s.collection_visible("Navmesh")
+        row = lay.row(align=True)
+        row.operator("acb.toggle_navmesh", text="Hide Navmesh" if vis else "Show Navmesh",
+                     icon="HIDE_OFF" if vis else "HIDE_ON")
+        _escort_toggle(row, s)
+        uid = _flow_of(context.active_object)
+        if uid is None:
+            lay.label(text="Click a crowd flow (green-blue line) to edit it")
+        else:
+            f = s.flow_graph.get(uid)
+            box = lay.box()
+            box.label(text=f"{s.doc.name_of(uid)}: {len(f.points) if f else '?'} points", icon="CURVE_PATH")
+            if context.mode == "EDIT_CURVE":
+                col = box.column(align=True)
+                for t in ("G: move points (G Z: height)", "E: extend from an end point",
+                          "Right-click > Subdivide: add points", "X > Vertices: delete points",
+                          "Apply: snap to the navmesh, update NPC data"):
+                    col.label(text=t)
+                box.operator("acb.apply", icon="CHECKMARK")
+            else:
+                box.operator("acb.edit_flow", icon="EDITMODE_HLT")
+        lay.label(text="Points must stay on the navmesh", icon="INFO")
+
+
 class ACB_PT_escort(ACBPanel, bpy.types.Panel):
     bl_label = "Escort Paths (VIP routes)"
     bl_parent_id = "ACB_PT_map"
@@ -1161,6 +1249,7 @@ class ACB_PT_escort(ACBPanel, bpy.types.Panel):
         if 7 not in s.wd.modes:
             lay.label(text="this world has no Escort data")
             return
+        _escort_toggle(lay, s)
         row = lay.row(align=True)
         row.prop(context.scene, "acb_path_index", text=f"Path (0-{max(len(s.vip_paths) - 1, 0)})")
         row.operator("acb.path_new", text="", icon="ADD")
@@ -1258,10 +1347,11 @@ CLASSES = (ACB_OT_open_map, ACB_OT_close_map, ACB_OT_toggle_collision, ACB_OT_re
            ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_edit_boundary, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
            ACB_OT_strip_guidance,
            ACB_OT_spawn_add, ACB_OT_spawn_set, ACB_OT_spawn_drop, ACB_OT_spawn_show,
+           ACB_OT_toggle_navmesh, ACB_OT_toggle_escort, ACB_OT_edit_flow,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_reverse, ACB_OT_path_add_selected, ACB_OT_path_mark,
            ACB_OT_path_draw, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,
-           ACB_PT_map, ACB_PT_tools, ACB_PT_spawns, ACB_PT_escort, ACB_PT_inspector)
+           ACB_PT_map, ACB_PT_tools, ACB_PT_spawns, ACB_PT_flows, ACB_PT_escort, ACB_PT_inspector)
 
 
 def register():

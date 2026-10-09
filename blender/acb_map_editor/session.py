@@ -26,7 +26,9 @@ import struct
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
+from acbmap import flowedit as FE
 from acbmap import flows as F
+from acbmap import navmesh as NM
 from acbmap import guidance as G
 from acbmap import oob as OOB
 from acbmap import ops
@@ -55,7 +57,7 @@ EMPTY_STYLE = {
 }
 SKIP_KINDS = {"visual", "other"}      # no shape, no gameplay: imported only when they have a visual mesh
 WIRE_VISUAL_KINDS = {"out_of_bounds"}   # visual = the boundary fog wall: a wireframe child, the element stays an empty
-LOCKED_KINDS = {"crowd_flow", "nav_flow"}   # their points carry navmesh triangle refs: moving them breaks the crowd
+LOCKED_KINDS = {"crowd_flow", "nav_flow"}   # the object stays put; its points are edited in Edit Mode (flowedit)
 FLOW_KINDS = ("crowd_flow", "nav_flow")
 SPAWN_COLORS = {   # spawns.label -> marker colour
     "Free-for-all": (0.85, 0.85, 0.85, 1), "Team 1": (0.15, 0.4, 1.0, 1), "Team 2": (1.0, 0.2, 0.15, 1),
@@ -893,6 +895,55 @@ class Session:
                 old.user_remap(new)
             bpy.data.meshes.remove(old)
 
+    @property
+    def nav(self) -> "NM.NavData":
+        if getattr(self, "_nav", None) is None:
+            self._nav = NM.NavData(self.doc)
+        return self._nav
+
+    def refresh_flow_curve(self, uid):
+        """Redraw a crowd flow's line from the document (after an edit, or to undo a rejected one)."""
+        ob = bpy.data.objects.get(self.flow_names.get(uid, ""))
+        if ob is None or ob.type != "CURVE":
+            return
+        in_edit = ob.mode == "EDIT"
+        if in_edit:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        cf = F.flow_component(self.doc.obj(uid))
+        pts = [struct.unpack("<3f", p.fields["FlowPosition"][:12]) for p in cf.fields["NavFlowPointsLocal"]]
+        cu = ob.data
+        cu.splines.clear()
+        sp = cu.splines.new("POLY")
+        sp.points.add(len(pts) - 1)
+        for p, v in zip(sp.points, pts):
+            p.co = (*v, 1)
+        if in_edit:
+            bpy.ops.object.mode_set(mode="EDIT")
+
+    def navmesh_object(self):
+        """Display-only mesh of every navmesh triangle (where NPCs can walk), built on first use."""
+        name = f"Navmesh [{self.tag}]"
+        ob = bpy.data.objects.get(name)
+        if ob is not None:
+            return ob
+        verts, faces = [], []
+        nav = self.nav
+        for m in nav.mgr:
+            for n in range(len(nav.mgr[m].fields["NavigationMeshes"])):
+                ms = nav.mesh(m, n)
+                base = len(verts)
+                verts += [(x, y, z + 0.03) for x, y, z in ms.verts]
+                faces += [tuple(base + i for i in t) for t in ms.tris]
+        me = bpy.data.meshes.new(f"ACB_Navmesh_{self.tag}")
+        me.from_pydata(verts, [], faces)
+        me.materials.append(flat_material("ACB Navmesh", (0.2, 0.55, 1.0, 1)))
+        ob = bpy.data.objects.new(name, me)
+        self.coll("Navmesh").objects.link(ob)
+        ob.hide_select = True
+        ob.display_type = "WIRE"
+        ob.show_in_front = True
+        return ob
+
     def _flow_curve(self, e):
         """A crowd flow as a clickable line along its points (entity-local, so the object sits at the entity)."""
         cf = F.flow_component(e.obj)
@@ -1071,7 +1122,7 @@ class Session:
         """Push Blender-side changes into the document. Returns a log of what changed."""
         doc, log = self.doc, []
         for ob in self.scene.objects:      # edit-mode changes reach ob.data only when flushed
-            if ob.mode == "EDIT" and ob.type == "MESH":
+            if ob.mode == "EDIT" and ob.type in ("MESH", "CURVE"):
                 ob.update_from_editmode()
         bpy.context.view_layer.update()   # matrix_world of just-moved objects is stale until the depsgraph runs
         by_key: dict[str, list] = {}
@@ -1116,6 +1167,9 @@ class Session:
                 if parse_key(k)[1] >= 0:
                     log.append(f"skipped {ob.name}: duplicating group children isn't supported, duplicate the group")
                     continue
+                if ob.get("acb_kind") in FLOW_KINDS:   # a copy would share the original's navigation data
+                    log.append(f"skipped {ob.name}: crowd flows can't be copied; extend one in Edit Mode instead")
+                    continue
                 try:
                     nk = ops.duplicate(doc, parse_key(k), from_blender(ob.matrix_world))
                 except ops.EditError as ex:
@@ -1157,6 +1211,25 @@ class Session:
             if part.startswith("zone:"):
                 self._write_zone(parse_key(ek), part[5:], ob)
                 log.append(f"zone {ob.name}")
+        # crowd flow points (edited in Edit Mode)
+        flows_changed = False
+        for k, obs in by_key.items():
+            ob = obs[0] if "|" not in k else None
+            if ob is None or ob.get("acb_kind") not in FLOW_KINDS or ob.type != "CURVE" or not ob.data.splines:
+                continue
+            uid = parse_key(k)[0]
+            pts = [tuple(ob.matrix_world @ Vector(p.co[:3])) for p in ob.data.splines[0].points]
+            old = FE.world_points(self.doc.obj(uid))
+            if len(pts) == len(old) and all(math.dist(a, b) <= FE.MOVED for a, b in zip(pts, old)):
+                continue
+            try:
+                st = FE.set_flow_points(self.doc, self.nav, uid, pts)
+                log.append(f"crowd flow {ob.name}: {st['points']} points, {st['moved']} moved or new")
+            except ops.EditError as ex:
+                log.append(f"NOT changed {ob.name}: {ex}")
+            self.refresh_flow_curve(uid)
+            self._flows = None
+            flows_changed = True
         # collision geometry
         for me in bpy.data.meshes:
             if "acb_shape" not in me or me.users == 0:
@@ -1170,6 +1243,8 @@ class Session:
             if stale:
                 log.append(f"climb edges now stale on {', '.join(stale[:3])}{' ...' if len(stale) > 3 else ''}: "
                            "Generate or Remove Climb Edges")
+        if flows_changed:
+            self._build_vip_curves()   # Escort paths are drawn along their flows
         if chests_changed:
             n = self.wd.sync_chests()
             log.append(f"chest capture world data regenerated ({n} chests)")

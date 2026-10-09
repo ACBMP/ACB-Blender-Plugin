@@ -486,10 +486,12 @@ def activate(doc: MapDocument, blk: int, ids) -> None:
 # ------------------------------------------------------------------ delete --
 
 def references_to(doc: MapDocument, ids: set[int], skip: set[int] = frozenset()) -> list[tuple[int, str]]:
-    """Decoded roots (outside `skip`) that link to any of `ids` -> [(root uid, field)]."""
+    """Decoded roots (outside `skip`) that link to any of `ids` -> [(root uid, field)]. Navigation data
+    (NavMeshManager: navmesh source entities, metalink objects) doesn't count: it's baked, and the navmesh stays as
+    it was when what it was built from is removed (the editor doesn't rebuild it)."""
     hits = []
     for u in doc.info:
-        if u in skip:
+        if u in skip or doc.type_of(u) == "NavMeshManager":
             continue
         r = doc.root(u)
         if r is None:

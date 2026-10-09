@@ -47,7 +47,8 @@ Tests: `.venv/bin/pytest tests/` (headless edits), and
 switching and closing maps;
 `xvfb-run -a blender --factory-startup --python tests/blender_oob_ui.py -- <forge>` edits it in Edit Mode, which needs a window;
 `xvfb-run -a blender --factory-startup --enable-event-simulate --python tests/blender_spawns_paths_ui.py -- <forge>` draws an
-Escort path with simulated clicks and edits spawns).
+Escort path with simulated clicks and edits spawns; `tests/blender_flow_edit_ui.py` (also windowed) edits a crowd
+flow's points in Edit Mode).
 They read a real map, `$ACB_MULTI` (default: the vbox install path).
 
 ## Workflow (Blender)
@@ -86,6 +87,13 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      facing the way the view looks. Spawns are drawn as figures coloured by kind, with arrows the way the player
      faces; G moves and R Z turns them as usual. With spawns selected: turn them into another kind in one click
      (a spawn made a Chest gets the chest data layer and joins Chest Capture's list), and **Drop to Ground**.
+   - **NPC Paths (crowd flows)** (panel): the green-blue lines crowd NPCs walk (and Escort VIPs follow). Click one,
+     **Edit Flow Points**, then in Edit Mode: G moves points, E extends from an end point, right-click → Subdivide
+     adds points, X → Vertices deletes; **Apply** (works in Edit Mode). Every point is put onto the navmesh (its
+     height snapped to the walkable surface) and the map's navigation data is updated with it: the point's navmesh
+     triangle, its waypoint, and the waypoints NPCs use to get on and off the flow at that point. A point that isn't
+     over the navmesh is refused and the line goes back. **Show Navmesh** draws the walkable surface (blue wire).
+     Flows can't be copied (a copy would share the original's navigation data).
    - **Escort Paths (VIP routes)** (panel): the routes the Escort VIP NPCs walk, made of crowd flows (the
      green-blue lines). **Draw Path**, then click flows in the viewport: each click extends the path through the
      connected flows up to the one clicked, so clicking the start and a few points along the way is enough.
@@ -93,6 +101,8 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      Enter / Esc / right-click finishes. The current path is drawn thick with numbered nodes (spheres = VIP
      spawns, cones = checkpoints); red segments join flows that aren't connected (the VIP may not walk them).
      The node list can also toggle spawn/checkpoint, reorder and remove nodes; **Reverse** flips the path.
+     **Hide Escort Paths** (also in the NPC Paths panel) hides the path lines, which sit on the crowd flows they
+     follow; Draw Path shows them again.
    - **Inspector**: every serialized field of the active element and its components. Click a value to edit it;
      links jump to their target.
 3. **Apply Edits** (also done by Save) pushes Blender changes into the document. **Save Forge** writes
@@ -165,9 +175,11 @@ acbmap install <forge> | uninstall <name> | status
   crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Materials use the diffuse and
   normal maps (visible in Material Preview / Rendered shading); specular maps are ignored, and materials without a
   diffuse texture (blend spots, decals, FX planes) show plain white.
-- **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle and waypoint refs
-  (into the opaque NavMeshManager), so Escort paths are routed over the map's existing flows. NPCs ignore new
-  collision, and on a cleared map they keep walking the old map's navmesh.
+- **Navmesh isn't rebuilt.** Crowd flow points can be moved, added and removed on the existing navmesh, but not
+  off it, and new flows can't be created yet. NPCs ignore new collision, and on a cleared map they keep walking the
+  old map's navmesh. Where NPCs get on and off an edited flow is recomputed by line of sight over the navmesh
+  (nearest 32 waypoints visible through a 0.4 m corridor); retail's lists are a smaller selection made by Ubisoft's
+  tool, whose rule isn't known, so edited points get more connections than retail ones. Untested in game.
 - **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. The
   generator makes ledges and swing poles (the only other type the MP maps use; poles match retail's: 186 of 190
   found, 178 of 184 generated are retail poles). Ledges follow physical rules, but retail's were placed by hand:
