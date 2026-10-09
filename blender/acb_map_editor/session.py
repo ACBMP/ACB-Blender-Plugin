@@ -23,12 +23,15 @@ import math
 import os
 import struct
 
+import bmesh
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
 from acbmap import flowedit as FE
 from acbmap import flows as F
 from acbmap import navmesh as NM
+from acbmap import navedit as NE
+from acbmap import navmodel as NMO
 from acbmap import guidance as G
 from acbmap import oob as OOB
 from acbmap import ops
@@ -967,28 +970,178 @@ class Session:
             bpy.ops.object.mode_set(mode="EDIT")
 
     def navmesh_object(self):
-        """Display-only mesh of every navmesh triangle (where NPCs can walk), built on first use."""
+        """The navmesh (where NPCs can walk) as a mesh, built on first use. Edit it in Edit Mode (Edit Navmesh):
+        deleting faces takes ground away, new faces (extrude / fill) add walkable ground, moving vertices reshapes
+        it; Apply rebuilds the navigation data of the navmeshes that changed (navedit). Vertices are welded, so
+        moving one moves every navmesh corner there; each face remembers its navmesh (acb_mgr / acb_nm)."""
         name = f"Navmesh [{self.tag}]"
         ob = bpy.data.objects.get(name)
         if ob is not None:
             return ob
-        verts, faces = [], []
-        nav = self.nav
-        for m in nav.mgr:
-            for n in range(len(nav.mgr[m].fields["NavigationMeshes"])):
-                ms = nav.mesh(m, n)
-                base = len(verts)
-                verts += [(x, y, z + 0.03) for x, y, z in ms.verts]
-                faces += [tuple(base + i for i in t) for t in ms.tris]
-        me = bpy.data.meshes.new(f"ACB_Navmesh_{self.tag}")
-        me.from_pydata(verts, [], faces)
-        me.materials.append(flat_material("ACB Navmesh", (0.2, 0.55, 1.0, 1)))
+        me = self._navmesh_mesh()
         ob = bpy.data.objects.new(name, me)
+        ob["acb_navmesh"] = True
         self.coll("Navmesh").objects.link(ob)
         ob.hide_select = True
         ob.display_type = "WIRE"
         ob.show_in_front = True
         return ob
+
+    def _navmesh_mesh(self, me=None):
+        model = self.navmodel
+        vid, verts, faces, mgr, nm = {}, [], [], [], []
+        for m in model.mgr.values():
+            for n, ms in enumerate(m.meshes):
+                for t in ms.tris:
+                    f = []
+                    for p in t.corners():
+                        k = NE._key(p)
+                        if k not in vid:
+                            vid[k] = len(verts)
+                            verts.append(p)
+                        f.append(vid[k])
+                    if len(set(f)) == 3:
+                        faces.append(f)
+                        mgr.append(m.idx)
+                        nm.append(n)
+        if me is None:
+            me = bpy.data.meshes.new(f"ACB_Navmesh_{self.tag}")
+            me.materials.append(flat_material("ACB Navmesh", (0.2, 0.55, 1.0, 1)))
+        else:
+            me.clear_geometry()
+        me.from_pydata(verts, [], faces)
+        for a in ("acb_mgr", "acb_nm"):
+            if a not in me.attributes:
+                me.attributes.new(a, "INT", "FACE")
+        me.attributes["acb_mgr"].data.foreach_set("value", mgr)
+        me.attributes["acb_nm"].data.foreach_set("value", nm)
+        me.update()
+        self.nav_base = self._navmesh_hash(me)
+        return me
+
+    @staticmethod
+    def _navmesh_hash(me) -> str:
+        return mesh_hash(me)   # geometry only: face attributes can't be read in Edit Mode, and editing changes both
+
+    @property
+    def navmodel(self) -> "NMO.NavModel":
+        """The navigation data as objects (navmodel); rebuilt after anything else changed the managers."""
+        if getattr(self, "_navmodel", None) is None:
+            self._navmodel = NMO.NavModel(self.doc, self.nav)
+        return self._navmodel
+
+    def navmesh_triangles(self, ob):
+        """(world triangles, owner navmesh or None) of the navmesh object as it is now."""
+        me = ob.data
+        model = self.navmodel
+        if ob.mode == "EDIT":   # the face attributes live in the edit BMesh (same face order once flushed)
+            ob.update_from_editmode()
+            bm = bmesh.from_edit_mesh(me)
+            lm, ln = bm.faces.layers.int.get("acb_mgr"), bm.faces.layers.int.get("acb_nm")
+            mgr = [f[lm] for f in bm.faces] if lm is not None else [-1] * len(bm.faces)
+            nm = [f[ln] for f in bm.faces] if ln is not None else [-1] * len(bm.faces)
+        else:
+            n = len(me.polygons)
+            mgr, nm = [-1] * n, [-1] * n
+            if "acb_mgr" in me.attributes:
+                me.attributes["acb_mgr"].data.foreach_get("value", mgr)
+                me.attributes["acb_nm"].data.foreach_get("value", nm)
+        me.calc_loop_triangles()
+        mw = ob.matrix_world
+        co = [tuple(mw @ v.co) for v in me.vertices]
+        tris, owners = [], []
+        for lt in me.loop_triangles:
+            tris.append(tuple(co[i] for i in lt.vertices))
+            p = lt.polygon_index
+            m = model.mgr.get(mgr[p])
+            owners.append(m.meshes[nm[p]] if m is not None and 0 <= nm[p] < len(m.meshes) else None)
+        return tris, owners
+
+    def navmesh_changed(self) -> bool:
+        ob = bpy.data.objects.get(f"Navmesh [{self.tag}]")
+        if ob is None or getattr(self, "nav_base", None) is None:
+            return False
+        if ob.mode == "EDIT":
+            ob.update_from_editmode()
+        return self._navmesh_hash(ob.data) != self.nav_base
+
+    def _nav_edit(self, what: str, fn) -> list[str]:
+        """Run a navedit operation; afterwards everything derived from the navigation data is rebuilt."""
+        try:
+            st = fn(self.navmodel)
+        except ops.EditError as ex:
+            self._navmodel = None   # the failed edit spoiled the model (the document is untouched)
+            self.rebuild_navmesh()
+            return [f"NOT changed the navmesh ({what}): {ex}"]
+        self._nav = None
+        self._navmodel = None
+        self._flows = None
+        self.rebuild_navmesh()
+        if not st.get("navmeshes_rebuilt"):
+            return [f"navmesh ({what}): nothing changed"]
+        parts = [f"{st.get('triangles_changed', 0)} triangles changed",
+                 f"{st['navmeshes_rebuilt']} navmeshes rebuilt"]
+        for k, label in (("navmeshes_added", "new navmeshes"), ("navmeshes_removed", "navmeshes removed"),
+                         ("seams_added", "seams"), ("waypoints_added", "waypoints added"),
+                         ("waypoints_removed", "waypoints removed"), ("flow_points_moved", "flow points re-found")):
+            if st.get(k):
+                parts.append(f"{st[k]} {label}")
+        dropped = sum(v for k, v in st.items() if k.startswith("links_removed_type") and k != "links_removed_type0")
+        if dropped:
+            parts.append(f"{dropped} jump/climb/drop links dropped")
+        return [f"navmesh ({what}): " + ", ".join(parts)]
+
+    def rebuild_navmesh(self):
+        ob = bpy.data.objects.get(f"Navmesh [{self.tag}]")
+        if ob is None:
+            return
+        edit = ob.mode == "EDIT"
+        if edit:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        self._navmesh_mesh(ob.data)
+        if edit:
+            bpy.ops.object.mode_set(mode="EDIT")
+
+    def apply_navmesh(self) -> list[str]:
+        ob = bpy.data.objects.get(f"Navmesh [{self.tag}]")
+        if ob is None or not self.navmesh_changed():
+            return []
+        tris, owners = self.navmesh_triangles(ob)
+        return self._nav_edit("edited faces", lambda m: NE.apply_triangles(m, self.doc, tris, owners))
+
+    @staticmethod
+    def object_triangles(objs):
+        out = []
+        dg = bpy.context.evaluated_depsgraph_get()
+        for ob in objs:
+            if ob.type != "MESH":
+                continue
+            ev = ob.evaluated_get(dg)
+            me = ev.to_mesh()
+            try:
+                me.calc_loop_triangles()
+                mw = ob.matrix_world
+                co = [tuple(mw @ v.co) for v in me.vertices]
+                out += [tuple(co[i] for i in lt.vertices) for lt in me.loop_triangles]
+            finally:
+                ev.to_mesh_clear()
+        return out
+
+    def navmesh_block(self, objs) -> list[str]:
+        log = self.apply_navmesh()   # pending face edits first: the cut works on them
+        tris = self.object_triangles(objs)
+        if not tris:
+            return log + ["select one or more mesh objects to block with"]
+        return log + self._nav_edit("blocked " + ", ".join(o.name for o in objs[:3]),
+                                    lambda m: NE.block_area(m, self.doc, tris))
+
+    def navmesh_add(self, objs, solid=True) -> list[str]:
+        log = self.apply_navmesh()
+        tris = self.object_triangles(objs)
+        if not tris:
+            return log + ["select one or more mesh objects whose top faces should become walkable"]
+        return log + self._nav_edit("walkable " + ", ".join(o.name for o in objs[:3]),
+                                    lambda m: NE.add_surface(m, self.doc, tris, solid=solid))
 
     def _flow_curve(self, e):
         """A crowd flow as a clickable line along its points (entity-local, so the object sits at the entity)."""
@@ -1278,7 +1431,12 @@ class Session:
                 log.append(f"NOT changed {ob.name}: {ex}")
             self.refresh_flow_curve(uid)
             self._flows = None
+            self._navmodel = None   # set_flow_points changed the managers behind the model's back
             flows_changed = True
+        # the navmesh itself (Edit Navmesh)
+        nav_log = self.apply_navmesh()
+        log += nav_log
+        flows_changed |= any(not x.startswith("NOT") and "nothing changed" not in x for x in nav_log)
         # collision geometry
         for me in bpy.data.meshes:
             if "acb_shape" not in me or me.users == 0:

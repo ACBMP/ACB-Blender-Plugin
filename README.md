@@ -70,7 +70,7 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      out-of-bounds. Then import your geometry (File → Import → Wavefront OBJ / FBX), select it and use Mesh to
      Collision, and move the spawns onto it. The map still installs over the map it came from. New pieces go
      into the always-loaded grid cell; the few elements new objects are cloned from stay, hidden and never loaded
-     in game. The navmesh stays the old map's.
+     in game. The navmesh stays the old map's until you edit it (Navmesh panel: Block Area / Add Walkable).
    - Visible geometry: **Mesh to Scenery** turns a plain mesh into a visible object without collision; **Replace
      Visual** (select a plain mesh, then the element) swaps an element's visible mesh. Material slots holding one of
      the map's materials (`ACBMat_*`, in the material list once a map is open) keep it; a slot whose Base Color
@@ -91,6 +91,17 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      facing the way the view looks. Spawns are drawn as figures coloured by kind, with arrows the way the player
      faces; G moves and R Z turns them as usual. With spawns selected: turn them into another kind in one click
      (a spawn made a Chest gets the chest data layer and joins Chest Capture's list), and **Drop to Ground**.
+   - **Navmesh (where NPCs walk)** (panel): the walkable surface every NPC (crowd, guards, Escort VIPs) paths
+     over. NPCs don't look at collision, only at this, so to make them walk somewhere new or keep them out of
+     somewhere, edit it. **Show Navmesh** draws it (blue wire). **Edit Navmesh** opens it in Edit Mode: X → Faces
+     takes ground away, E on boundary edges extends it, F fills new faces, G moves vertices (K cuts a precise
+     outline first). **Apply** rebuilds the navigation data of only the pieces that changed (see below); **Revert**
+     throws unapplied edits away. With objects selected: **Block Area** takes the ground away under them at their
+     height (put a cube where a new wall or crate stands: NPCs path around it), **Add Walkable** makes their top
+     faces (up to 45° steep) walkable, joined to the navmesh around them where their edges meet; with *Solid* the
+     ground under them stops being walkable (off for a bridge NPCs may also pass under). Crowd flow points must
+     stay on the navmesh: an edit that would leave one off it is refused (move the flow first). Edits work inside
+     the map's navigation grid only (its NavMeshManager cells, e.g. SanMarco's 96 x 128 m play area).
    - **NPC Paths (crowd flows)** (panel): the green-blue lines crowd NPCs walk (and Escort VIPs follow). Click one,
      **Edit Flow Points**, then in Edit Mode: G moves points, E extends from an end point, right-click → Subdivide
      adds points, X → Vertices deletes; **Apply** (works in Edit Mode). Every point is put onto the navmesh (its
@@ -167,6 +178,19 @@ acbmap install <forge> | uninstall <name> | status
   skins table's id. The skins forges are never edited. Chest data is regenerated from the map's chest spawns,
   with phantom twins exactly as retail has them.
 - Edited collision drops the stored MOPP (`MoppCodeVersionNumber=0`), so ACB compiles its own at load.
+- Navmesh edits (`acbmap/navedit.py` over `acbmap/navmodel.py`) rebuild only the navmeshes whose triangles changed.
+  Triangles are clipped at the 32 m cell borders (a navmesh belongs to one cell's NavMeshManager) and kept
+  counter-clockwise; unchanged triangles keep their retail neighbours, edge codes and links. Changed edges get a
+  seam (LinkType-0 metalink in the lower manager, side A its navmesh) where another navmesh's edge lies along them,
+  else wall (0xffe4) where ground was taken away or rises beyond, ledge (0xffe2) where it drops. Jump / climb /
+  drop links follow their edges (dropped when a side loses every triangle). Waypoints on changed ground are
+  re-found or removed, obstacle corners of the changed area get new ones 0.35 m off the corner, links running over
+  removed ground are cut and new / moved waypoints are linked to the waypoints they see (symmetric, nearest 10
+  within 40 m); changed triangles list their own and the nearest visible waypoints (pathfinding's way in).
+  DirectConnectionSets are the seam-connected components (as retail), the navmesh MoppCode is left empty
+  (`NavMesh::BuildMopp` compiles one at load when it's empty), AABVs are recomputed, and every index the edit moved
+  is rewritten, including the crowd flows' MetaLinkRef / TriangleArray / WayPointArray. With no edit the managers
+  come back byte-identical on every MP map.
 - Most retail static collision is merged into compounds (an entity with a `MultiInertComponent`, whose
   `MultiMeshShape` lists member entities and holds one MOPP over all of them; members have `IsMerged=1`). ACB
   uses that MOPP as stored and never gives a merged member its own rigid body. So moving, reshaping or deleting a
@@ -186,11 +210,14 @@ acbmap install <forge> | uninstall <name> | status
   crowd, birds) aren't shown. Out-of-bounds fog walls show as wireframe. Materials use the diffuse and
   normal maps (visible in Material Preview / Rendered shading); specular maps are ignored, and materials without a
   diffuse texture (blend spots, decals, FX planes) show plain white.
-- **Navmesh isn't rebuilt.** Crowd flow points can be moved, added and removed on the existing navmesh, but not
-  off it, and new flows can't be created yet. NPCs ignore new collision, and on a cleared map they keep walking the
-  old map's navmesh. Where NPCs get on and off an edited flow is recomputed by line of sight over the navmesh
-  (nearest 32 waypoints visible through a 0.4 m corridor); retail's lists are a smaller selection made by Ubisoft's
-  tool, whose rule isn't known, so edited points get more connections than retail ones. Untested in game.
+- **Navmesh** edits are untested in game. New navmeshes, waypoints and their links come from the editor's own
+  rules (corner waypoints, line-of-sight links), not Ubisoft's generator, so pathing over edited ground may look
+  less natural than retail's. Nothing is generated from collision: new collision still needs Block Area / Add
+  Walkable (or hand edits) to change where NPCs go, and new jump / climb / drop links aren't made (NPCs only step
+  between pieces that touch). Edits outside the map's NavMeshManager cells are refused (a new cell would need its
+  own grid-cell entry). New crowd flows can't be created yet. Where NPCs get on and off an edited flow is
+  recomputed by line of sight over the navmesh (nearest 32 waypoints visible through a 0.4 m corridor); retail's
+  lists are a smaller selection made by Ubisoft's tool, whose rule isn't known.
 - **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. The
   generator makes ledges and swing poles (the only other type the MP maps use). Over the 11 MP maps it finds 91% of
   retail's edges; about half of what it writes retail doesn't have (short side edges of beam ends and sills, extra

@@ -684,6 +684,114 @@ class ACB_OT_spawn_show(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------- navmesh --
+
+def _navmesh_ob(s):
+    return bpy.data.objects.get(f"Navmesh [{s.tag}]") if s is not None else None
+
+
+def _leave_navmesh_edit(context, s):
+    ob = _navmesh_ob(s)
+    if ob is not None and ob.mode == "EDIT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    if ob is not None:
+        ob.select_set(False)
+        ob.hide_select = True   # not in the way of clicking what stands on it
+
+
+class ACB_OT_navmesh_edit(bpy.types.Operator):
+    """Edit the navmesh (where NPCs can walk) in Edit Mode: delete faces to take ground away, extrude edges (E) or
+    fill (F) to add ground, move vertices to reshape it. Apply rebuilds the NPC navigation data"""
+    bl_idname = "acb.navmesh_edit"
+    bl_label = "Edit Navmesh"
+
+    def execute(self, context):
+        s = sess(context)
+        ob = s.navmesh_object()
+        s.set_collection_visible("Navmesh", True)
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        for x in context.selected_objects:
+            x.select_set(False)
+        ob.hide_select = False
+        ob.hide_set(False)
+        ob.select_set(True)
+        context.view_layer.objects.active = ob
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_mode(type="FACE")
+        return {"FINISHED"}
+
+
+class ACB_OT_navmesh_apply(bpy.types.Operator):
+    """Rebuild the NPC navigation data from the edited navmesh (only the navmeshes that changed)"""
+    bl_idname = "acb.navmesh_apply"
+    bl_label = "Apply Navmesh"
+
+    def execute(self, context):
+        s = sess(context)
+        log = s.apply_navmesh() or ["navmesh: no changes"]
+        _leave_navmesh_edit(context, s)
+        _report_log(self, log)
+        return {"CANCELLED"} if any(x.startswith("NOT") for x in log) else {"FINISHED"}
+
+
+class ACB_OT_navmesh_revert(bpy.types.Operator):
+    """Throw away navmesh edits that weren't applied"""
+    bl_idname = "acb.navmesh_revert"
+    bl_label = "Revert Navmesh"
+
+    def execute(self, context):
+        s = sess(context)
+        s.rebuild_navmesh()
+        return {"FINISHED"}
+
+
+def _footprint_objects(context, s):
+    nav = _navmesh_ob(s)
+    return [o for o in context.selected_objects if o.type == "MESH" and o is not nav]
+
+
+class ACB_OT_navmesh_block(bpy.types.Operator):
+    """Take the walkable ground away under the selected objects (e.g. a box you placed): NPCs path around
+    them. Only navmesh at the objects' height counts (from 1 m below their bottom to their top)"""
+    bl_idname = "acb.navmesh_block"
+    bl_label = "Block Area"
+
+    def execute(self, context):
+        s = sess(context)
+        objs = _footprint_objects(context, s)
+        if not objs:
+            self.report({"ERROR"}, "select the mesh objects whose footprint NPCs should avoid")
+            return {"CANCELLED"}
+        _leave_navmesh_edit(context, s)
+        log = s.navmesh_block(objs)
+        _report_log(self, log)
+        return {"CANCELLED"} if any(x.startswith("NOT") for x in log) else {"FINISHED"}
+
+
+class ACB_OT_navmesh_add(bpy.types.Operator):
+    """Make the selected objects' top faces walkable for NPCs (up to 45 degrees steep). The navmesh they overlap
+    at their height is replaced, so the two join where their edges meet"""
+    bl_idname = "acb.navmesh_add"
+    bl_label = "Add Walkable"
+
+    solid: bpy.props.BoolProperty(
+        name="Solid", default=True,
+        description="The objects are solid: the ground under them (down to 3 m) stops being walkable. Off for a "
+                    "bridge or a raised walkway NPCs may also pass under")
+
+    def execute(self, context):
+        s = sess(context)
+        objs = _footprint_objects(context, s)
+        if not objs:
+            self.report({"ERROR"}, "select the mesh objects NPCs should walk on")
+            return {"CANCELLED"}
+        _leave_navmesh_edit(context, s)
+        log = s.navmesh_add(objs, solid=self.solid)
+        _report_log(self, log)
+        return {"CANCELLED"} if any(x.startswith("NOT") for x in log) else {"FINISHED"}
+
+
 # ---------------------------------------------------------------- crowd flows --
 
 class ACB_OT_toggle_navmesh(bpy.types.Operator):
@@ -1248,6 +1356,48 @@ class ACB_PT_spawns(ACBPanel, bpy.types.Panel):
         lay.label(text="Players face the arrows; G moves, R Z turns")
 
 
+class ACB_PT_navmesh(ACBPanel, bpy.types.Panel):
+    bl_label = "Navmesh (where NPCs walk)"
+    bl_parent_id = "ACB_PT_map"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return sess(context) is not None
+
+    def draw(self, context):
+        s = sess(context)
+        lay = self.layout
+        ob = _navmesh_ob(s)
+        vis = ob is not None and s.collection_visible("Navmesh")
+        lay.operator("acb.toggle_navmesh", text="Hide Navmesh" if vis else "Show Navmesh",
+                     icon="HIDE_OFF" if vis else "HIDE_ON")
+        editing = ob is not None and ob.mode == "EDIT"
+        box = lay.box()
+        if editing:
+            col = box.column(align=True)
+            for t in ("X > Faces: take ground away", "E on edges: extend the ground",
+                      "F on vertices / edges: fill a new face", "G: move (G Z: height)",
+                      "K: knife a precise outline first"):
+                col.label(text=t)
+            row = box.row(align=True)
+            row.operator("acb.navmesh_apply", icon="CHECKMARK")
+            row.operator("acb.navmesh_revert", icon="LOOP_BACK", text="Revert")
+        else:
+            box.operator("acb.navmesh_edit", icon="EDITMODE_HLT")
+            if ob is not None and s.navmesh_changed():
+                box.label(text="edits not applied yet", icon="ERROR")
+                box.operator("acb.navmesh_apply", icon="CHECKMARK")
+        box = lay.box()
+        box.label(text="From selected objects:", icon="MESH_CUBE")
+        row = box.row(align=True)
+        row.operator("acb.navmesh_block", icon="CANCEL")
+        row.operator("acb.navmesh_add", icon="ADD").solid = context.scene.acb_nav_solid
+        box.prop(context.scene, "acb_nav_solid")
+        lay.label(text="Crowd flow points must stay on it", icon="INFO")
+        lay.label(text="Edit only inside the map's play area", icon="INFO")
+
+
 class ACB_PT_flows(ACBPanel, bpy.types.Panel):
     bl_label = "NPC Paths (crowd flows)"
     bl_parent_id = "ACB_PT_map"
@@ -1402,14 +1552,19 @@ CLASSES = (ACB_OT_open_map, ACB_OT_close_map, ACB_OT_toggle_collision, ACB_OT_re
            ACB_OT_strip_guidance,
            ACB_OT_spawn_add, ACB_OT_spawn_set, ACB_OT_spawn_drop, ACB_OT_spawn_show,
            ACB_OT_toggle_navmesh, ACB_OT_toggle_escort, ACB_OT_edit_flow,
+           ACB_OT_navmesh_edit, ACB_OT_navmesh_apply, ACB_OT_navmesh_revert, ACB_OT_navmesh_block, ACB_OT_navmesh_add,
            ACB_OT_path_new, ACB_OT_path_delete, ACB_OT_path_reverse, ACB_OT_path_add_selected, ACB_OT_path_mark,
            ACB_OT_path_close, ACB_OT_path_draw, ACB_OT_path_node,
            ACB_OT_toggle, ACB_OT_edit_field, ACB_OT_select_link,
-           ACB_PT_map, ACB_PT_tools, ACB_PT_spawns, ACB_PT_flows, ACB_PT_escort, ACB_PT_inspector)
+           ACB_PT_map, ACB_PT_tools, ACB_PT_spawns, ACB_PT_navmesh, ACB_PT_flows, ACB_PT_escort, ACB_PT_inspector)
 
 
 def register():
     bpy.types.Scene.acb_path_index = bpy.props.IntProperty(name="Path", min=0, default=0, update=_path_index_update)
+    bpy.types.Scene.acb_nav_solid = bpy.props.BoolProperty(
+        name="Solid (no walking under it)", default=True,
+        description="Add Walkable: the ground under the objects (down to 3 m) stops being walkable. Off for a bridge "
+                    "or a raised walkway NPCs may also pass under")
     for c in CLASSES:
         bpy.utils.register_class(c)
     bpy.app.handlers.load_post.append(S.forget_sessions)
@@ -1423,3 +1578,4 @@ def unregister():
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.acb_path_index
+    del bpy.types.Scene.acb_nav_solid
