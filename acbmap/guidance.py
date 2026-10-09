@@ -3,11 +3,11 @@
 Layout (inferred from the retail maps; every field below round-trips through fastload):
 - GuidanceObjects: one per edge. Index0/Index1 index the points; SubType is GuidanceObjectSubType (1 ledge grab,
   2 beam, 3 ladder, 4 pole, 5 rope, 13 haystack, ...; the MP maps use only 1, 4, 7, 13 and, in the ACFE ports, 14);
-  DecN4Normal0/1 are four int16 each, xyz scaled by 511 and a zero w. One is the walkable top's normal, the other
-  in most retail edges (about 80% of those that can be told apart) the horizontal direction pointing inward, across
-  the top, not the wall's outward normal. Retail stores both orders (56% top first), so the game tells them apart
-  itself. Poles are thin bars (retail: 2 m x 10 cm x 30 cm) with one pole edge along each top long edge, each
-  pointing inward across the bar.
+  DecN4Normal0/1 are four int16 each, xyz scaled by 510 and a zero w: the two faces' outward normals, the walkable
+  top's and the wall's (95% of retail edges; the wall's may slant). Either may come first (retail: 72% top first),
+  but the edge runs so that (p1 - p0) x n0 . n1 > 0 -- every retail edge, ledges and poles. In game, edges with
+  inward side directions and either run (what this module wrote at first) can't be grabbed. Poles are thin bars
+  (retail: 2 m x 10 cm x 30 cm) with one pole edge along each top long edge.
 - CompressPoints: x,y,z per point on a fixed 5 mm grid, offset binary: u16 = floor(p / 0.005) + 32768 (so +-163 m,
   entity-local like the collision shapes). 99.5% of retail points decode onto their collision mesh edges. The
   Partitioner's Min/Max is just the points' bounds (the float points, so 0-5 mm off the grid); it is not used to
@@ -101,11 +101,11 @@ def points(g: Obj) -> list[tuple[float, float, float]]:
 
 def _dn4(b: bytes):
     x, y, z, _w = struct.unpack("<4h", b)
-    return (x / 511, y / 511, z / 511)
+    return (x / 510, y / 510, z / 510)
 
 
 def _pack_dn4(n) -> bytes:
-    return struct.pack("<4h", *(max(-511, min(511, round(c * 511))) for c in n), 0)
+    return struct.pack("<4h", *(max(-510, min(510, round(c * 510))) for c in n), 0)
 
 
 def edges(g: Obj) -> list[Edge]:
@@ -193,9 +193,6 @@ def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: floa
         t = _norm(_sub(wv[v], wv[u]))
         if abs(t[2]) > MAX_EDGE_SLOPE:
             continue
-        inward = _norm((-t[1], t[0], 0.0))
-        if _dot(inward, _sub(wv[far0], wv[u])) < 0:
-            inward = (-inward[0], -inward[1], 0.0)
 
         def reach(p, u=u, t=t):   # horizontal distance of p from the edge line
             r = _sub(p, wv[u])
@@ -206,11 +203,18 @@ def generate(verts, tris, slope_cos_: float = DEFAULT_SLOPE_COS, min_depth: floa
         depth = spread(f0, lambda f: normals[f][2] >= slope_cos_, reach)
         drop = spread(f1, lambda f: normals[f][2] <= STEEP_Z and all(wv[i][2] <= top + 1e-3 for i in faces[f]),
                       lambda p, top=top: top - p[2])
-        raw.append(Edge(wv[u], wv[v], n0, inward, LEDGE, depth, drop))
+        raw.append(Edge(wv[u], wv[v], n0, n1, LEDGE, depth, drop))
     merged = [e for e in _merge(raw) if math.dist(e.p0, e.p1) >= MIN_EDGE]
     poles = _find_poles(merged)
-    return [e for i, e in enumerate(merged)
+    return [_oriented(e) for i, e in enumerate(merged)
             if (i in poles and e.drop > 0) or (e.depth >= min_depth and e.drop >= min_drop)]
+
+
+def _oriented(e: Edge) -> Edge:
+    """e running the way retail edges do: (p1 - p0) x n0 . n1 > 0."""
+    if _dot(_cross(_sub(e.p1, e.p0), e.n0), e.n1) < 0:
+        e.p0, e.p1 = e.p1, e.p0
+    return e
 
 
 HANG_OUT = 0.15        # hang-space probe: this far out from the edge (m)
@@ -230,7 +234,8 @@ def world_filter(edge_list: list[Edge], world, matrix: bytes, key, min_drop: flo
     out = []
     for e in edge_list:
         p0, p1 = np.asarray(e.p0), np.asarray(e.p1)
-        outward = -np.asarray(e.n1)
+        outward = np.array([e.n1[0], e.n1[1], 0.0])
+        outward /= max(np.linalg.norm(outward), 1e-9)
         ok = 0
         for f in (0.25, 0.5, 0.75):
             s_ = p0 + (p1 - p0) * f
@@ -252,7 +257,7 @@ def _pole_side(e: Edge) -> bool:
 
 
 def _find_poles(edges_: list[Edge]) -> set[int]:
-    """Indices of edges that pair up across a thin bar: parallel, same top, inward directions facing each other,
+    """Indices of edges that pair up across a thin bar: parallel, same top, wall normals facing away from each other,
     overlapping, at most POLE_MAX_WIDTH apart. They become poles."""
     out = set()
     for i, a in enumerate(edges_):
@@ -266,7 +271,7 @@ def _find_poles(edges_: list[Edge]) -> set[int]:
             tb = _norm(_sub(b.p1, b.p0))
             if abs(_dot(ta, tb)) < MERGE_COS:
                 continue
-            gap = _dot(_sub(b.p0, a.p0), a.n1)      # across the bar, along a's inward direction
+            gap = -_dot(_sub(b.p0, a.p0), a.n1)     # across the bar, against a's outward wall normal
             if not 0 < gap <= POLE_MAX_WIDTH:
                 continue
             # overlap along the bar

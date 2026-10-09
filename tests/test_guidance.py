@@ -26,7 +26,9 @@ def test_box_has_four_top_ledges():
         assert e.p0[2] == e.p1[2] == 2
         assert e.n0 == (0.0, 0.0, 1.0) and abs(e.n1[2]) < 1e-9
         mid = [(a + b) / 2 for a, b in zip(e.p0, e.p1)]
-        assert all(0 <= m + 0.5 * n <= 2 for m, n in zip(mid[:2], e.n1[:2])), "second normal points inward"
+        assert not all(0 <= m + 0.5 * n <= 2 for m, n in zip(mid[:2], e.n1[:2])), "second normal: the wall's, outward"
+        d = [b - a for a, b in zip(e.p0, e.p1)]
+        assert G._dot(G._cross(d, e.n0), e.n1) > 0, "runs the way every retail edge does"
         assert e.subtype == G.LEDGE
 
 
@@ -150,3 +152,18 @@ def test_points_fill_their_box():
             fit += all(abs(lo[k] - min(p[k] for p in pts)) < 0.006 for k in range(3))
             n += 1
     assert n > 100 and fit / n > 0.9
+
+
+@needs_map
+def test_retail_edges_run_one_way():
+    """Retail edges carry the top's and the wall's outward normals and run so that (p1 - p0) x n0 . n1 > 0."""
+    d = MapDocument(MAP)
+    n = 0
+    for e in classify(d, with_children=False):
+        for g in G.systems(e.obj):
+            for x in G.edges(g):
+                dv = G._sub(x.p1, x.p0)
+                if math.hypot(*dv) > 0.05:
+                    assert G._dot(G._cross(dv, x.n0), x.n1) > 0
+                    n += 1
+    assert n > 500
