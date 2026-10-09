@@ -43,7 +43,8 @@ ln -s "$PWD/blender/acb_map_editor" ~/.config/blender/5.2/scripts/addons/acb_map
 
 Tests: `.venv/bin/pytest tests/` (headless edits), and
 `blender --background --factory-startup --python tests/blender_smoke.py -- <map forge>` (the add-on end to end;
-`tests/blender_oob.py` the same way for the out-of-bounds wall;
+`tests/blender_oob.py` the same way for the out-of-bounds wall, `tests/blender_switch_map.py -- <forge A> <forge B>` for
+switching and closing maps;
 `xvfb-run -a blender --factory-startup --python tests/blender_oob_ui.py -- <forge>` edits it in Edit Mode, which needs a window;
 `xvfb-run -a blender --factory-startup --enable-event-simulate --python tests/blender_spawns_paths_ui.py -- <forge>` draws an
 Escort path with simulated clicks and edits spawns).
@@ -52,7 +53,8 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
 ## Workflow (Blender)
 
 1. **Open ACB Map**: pick a `DataPC_*.forge`. The first open unpacks it into `~/.cache/acbmap/` (a few seconds);
-   after that, opening is near-instant. The map shows its textured visual meshes (most detailed LOD), and solid
+   after that, opening is near-instant. One map per scene: the folder button next to the map's name opens another
+   (closing this one), the **X** closes it (removes its objects; edits not saved to a forge are lost). The map shows its textured visual meshes (most detailed LOD), and solid
    shading is switched to texture colour. Untick *Visual meshes* in the file dialog for the collision-only view.
 2. Edit:
    - Move, rotate or scale elements as usual. **Shift+D** copies an element, **X** deletes it. Moving a group moves

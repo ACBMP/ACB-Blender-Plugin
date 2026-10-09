@@ -68,6 +68,9 @@ class ACB_OT_open_map(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
+        old = sess(context)
+        if old is not None:   # one map per scene
+            old.close()
         wm = context.window_manager
         wm.progress_begin(0, 1)
         try:
@@ -84,6 +87,28 @@ class ACB_OT_open_map(bpy.types.Operator):
             self.report({"WARNING"}, f"renumbered {s.migrated} object ids an earlier editor version put in the "
                                      "engine's runtime range (those objects never showed in game); save to keep it")
         self.report({"INFO"}, f"{os.path.basename(self.filepath)}: {n} editable objects")
+        return {"FINISHED"}
+
+
+class ACB_OT_close_map(bpy.types.Operator):
+    """Close the map: remove its objects from this scene (edits not saved to a forge are lost). Then open another"""
+    bl_idname = "acb.close_map"
+    bl_label = "Close Map"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event, title="Close the map?",
+                                                     message="Edits not saved to a forge are lost.",
+                                                     confirm_text="Close")
+
+    def execute(self, context):
+        s = sess(context)
+        if s is None:
+            for k in S.SCENE_PROPS:   # a stale link left on the scene: forget it
+                context.scene.pop(k, None)
+            return {"FINISHED"}
+        name = os.path.basename(s.source)
+        s.close()
+        self.report({"INFO"}, f"closed {name}")
         return {"FINISHED"}
 
 
@@ -111,6 +136,7 @@ class ACB_OT_reconnect(bpy.types.Operator):
             return {"CANCELLED"}
         s = S.Session(sc, sc.get("acb_saved") or src, sc.get("acb_multi"))
         s.source = src
+        sc["acb_forge"] = src
         s.attach()
         self.report({"INFO"}, f"reconnected: {len(s.objects)} objects")
         return {"FINISHED"}
@@ -1024,9 +1050,14 @@ class ACB_PT_map(ACBPanel, bpy.types.Panel):
         if s is None:
             lay.operator("acb.open_map", icon="FILEBROWSER")
             if context.scene.get("acb_forge"):
-                lay.operator("acb.reconnect", icon="LINKED")
+                row = lay.row(align=True)
+                row.operator("acb.reconnect", icon="LINKED")
+                row.operator("acb.close_map", text="", icon="X")
             return
-        lay.label(text=os.path.basename(s.source), icon="WORLD")
+        row = lay.row(align=True)
+        row.label(text=os.path.basename(s.source), icon="WORLD")
+        row.operator("acb.open_map", text="", icon="FILEBROWSER")
+        row.operator("acb.close_map", text="", icon="X")
         col = lay.column(align=True)
         col.operator("acb.apply", icon="CHECKMARK")
         col.operator("acb.save", icon="FILE_TICK")
@@ -1223,7 +1254,7 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
                 row.label(text=f"{r.label}: {r.text[:50]}")
 
 
-CLASSES = (ACB_OT_open_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
+CLASSES = (ACB_OT_open_map, ACB_OT_close_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
            ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_edit_boundary, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
            ACB_OT_strip_guidance,
            ACB_OT_spawn_add, ACB_OT_spawn_set, ACB_OT_spawn_drop, ACB_OT_spawn_show,
@@ -1237,9 +1268,14 @@ def register():
     bpy.types.Scene.acb_path_index = bpy.props.IntProperty(name="Path", min=0, default=0, update=_path_index_update)
     for c in CLASSES:
         bpy.utils.register_class(c)
+    bpy.app.handlers.load_post.append(S.forget_sessions)
+    bpy.app.handlers.load_factory_startup_post.append(S.forget_sessions)
 
 
 def unregister():
+    for h in (bpy.app.handlers.load_post, bpy.app.handlers.load_factory_startup_post):
+        if S.forget_sessions in h:
+            h.remove(S.forget_sessions)
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.acb_path_index

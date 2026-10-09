@@ -198,7 +198,21 @@ def normal_decode_group():
 
 
 def get(scene) -> "Session | None":
-    return SESSIONS.get(scene.name)
+    """The map open in this scene. Sessions are keyed by scene name, which repeats across files (every new file's
+    scene is "Scene"), so a session also has to match the token it left on its own scene."""
+    s = SESSIONS.get(scene.name)
+    if s is None or scene.get("acb_session") != s.token:
+        return None
+    return s
+
+
+@bpy.app.handlers.persistent
+def forget_sessions(*_args):
+    """A file was loaded or a new one started: no open map belongs to it (a reopened .blend is reconnected)."""
+    SESSIONS.clear()
+
+
+SCENE_PROPS = ("acb_forge", "acb_multi", "acb_tag", "acb_saved", "acb_session")
 
 
 class Session:
@@ -243,7 +257,40 @@ class Session:
         self.log: list[str] = []
         scene["acb_forge"] = forge_path
         scene["acb_multi"] = self.multi_dir
+        self.token = os.urandom(8).hex()
+        scene["acb_session"] = self.token
         SESSIONS[scene.name] = self
+
+    def close(self):
+        """Remove the map from its scene: its collections and objects, the data only they used, the scene's ACB
+        properties. Edits not saved to a forge are lost."""
+        sc = bpy.data.scenes.get(self.scene_name)
+        root = bpy.data.collections.get(self.root_coll_name) if self.root_coll_name else None
+        if root is not None:
+            colls = [root, *root.children_recursive]
+            for ob in {o for c in colls for o in c.objects}:
+                bpy.data.objects.remove(ob)
+            for c in reversed(colls):
+                bpy.data.collections.remove(c)
+        elif sc is not None:   # built straight into the scene collection
+            for ob in [o for o in sc.objects if "acb_key" in o or "acb_visual_of" in o or "acb_climb_of" in o]:
+                bpy.data.objects.remove(ob)
+        cache = os.path.abspath(self.doc.cache)
+        for _ in range(3):   # meshes free materials, materials free images
+            for coll in (bpy.data.meshes, bpy.data.curves, bpy.data.materials, bpy.data.images):
+                for d in list(coll):
+                    if d.users:
+                        continue
+                    ours = d.name.startswith(("ACB", "Escort")) or (
+                        coll is bpy.data.images and os.path.abspath(bpy.path.abspath(d.filepath)).startswith(cache))
+                    if ours:
+                        coll.remove(d)
+        if sc is not None:
+            for k in SCENE_PROPS:
+                if k in sc:
+                    del sc[k]
+        if SESSIONS.get(self.scene_name) is self:
+            del SESSIONS[self.scene_name]
 
     # ------------------------------------------------------------ build --
 
