@@ -160,10 +160,10 @@ acbmap install <forge> | uninstall <name> | status
 - **Navmesh isn't rebuilt.** Crowd flows are locked because their points carry navmesh triangle refs. NPCs ignore
   new collision, and on a cleared map they keep walking the old map's navmesh.
 - **Climb edges** (GuidanceSystem) are precomputed per entity, and moving an entity carries them along. The
-  generator makes ledges and swing poles (the only other type the MP maps use; poles match retail's: 186 of 190
-  found, 178 of 184 generated are retail poles). Ledges follow physical rules, but retail's were placed by hand:
-  facades get a ledge on every cornice where retail often has a few, so regenerating a retail object changes how it
-  climbs (about a quarter of retail ledge length is reproduced within 15 cm). Not yet tested in game.
+  generator makes ledges and swing poles (the only other type the MP maps use). Over the 11 MP maps it finds 91% of
+  retail's edges; about half of what it writes retail doesn't have (short side edges of beam ends and sills, extra
+  cornices), so regenerating a retail object adds handholds. Tested in game: generated edges grab, and a wall climbs
+  when its handholds are at most about 1.3 m apart (retail: 0.6 m median, the lowest about 0.75 m up).
 - Out-of-bounds walls: regenerating a retail boundary from its own corners reproduces its sections (centre, normal,
   size) on 6 of the 9 retail maps that have one exactly; the others differ by one tile split or by up to 22 cm.
   The fog mesh is rebuilt in the retail pattern (strip plus alpha fins at the corners), not edited in place.
