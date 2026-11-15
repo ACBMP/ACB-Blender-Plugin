@@ -301,3 +301,16 @@ def test_localized_copy_takes_its_texture_entries_along():
     probe.fields["_probe"] = Handle(0, idb(mat))   # something linking the material
     assert ops.localize_links(d, probe, dst) >= 1
     assert need <= {x.id & 0xFFFFFFFF for x in d._file(dst).deps}
+
+
+def test_delete_takes_own_shape_along(tmp_path):
+    d = MapDocument(MAP)
+    m = first(d, "collision").obj.fields["GlobalMatrix"]
+    tri = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
+    k = ops.new_collision(d, set_position(m, (1.0, 2.0, 3.0)), tri, [(0, 1, 2)], [0])
+    sid = u32(ops.inert_components(ops.element_obj(d, k))[0][1].fields["RigidBody"].fields["Shape"].id)
+    assert sid in d.info
+    assert ops.delete_many(d, [k]) == {k: None}
+    d2 = reopen(d, tmp_path)
+    assert k[0] not in d2.info and sid not in d2.info
+    assert ops.purge_orphan_shapes(d2) == []   # retail shapes are all still in use

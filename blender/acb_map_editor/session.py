@@ -250,6 +250,9 @@ class Session:
         self.migrated = 0
         if any(u >= ops.RUNTIME_ID_BASE for u in self.doc.info):   # saved by an editor version before the fix
             self.migrated = ops.migrate_runtime_ids(self.doc)
+        from acbmap.visual import fix_mesh_categories
+        self.migrated += fix_mesh_categories(self.doc)   # meshes an earlier version cloned from a pickup: invisible
+        self.migrated += ops.split_editor_meshes(self.doc)   # meshes an earlier version kept in grid cells: invisible
         self.source = forge_path
         self.multi_dir = multi_dir or os.path.dirname(forge_path)
         self.wd = WorldData(self.doc, self.multi_dir)
@@ -601,10 +604,11 @@ class Session:
         if surface == "auto":
             surface = ob.get("acb_surface") or (ops.surface_of(cv, ct) if collision else "wall")
         if mi is not None:
-            tree, leaves = SP.partition(mi.verts, mi.tris, mi.uvs, max_size=max_size)
+            cap = SP.MAX_COLLISION_TRIS if collision else SP.MAX_TRIS
+            tree, leaves = SP.partition(mi.verts, mi.tris, mi.uvs, max_tris=cap, max_size=max_size)
             col = SP.assign(tree, cv, ct) if collision else {}
         else:
-            tree, leaves = SP.partition(cv, ct, max_size=max_size)
+            tree, leaves = SP.partition(cv, ct, max_tris=SP.MAX_COLLISION_TRIS, max_size=max_size)
             col = dict(enumerate(leaves))
         keys = []
         for li, leaf in enumerate(leaves):

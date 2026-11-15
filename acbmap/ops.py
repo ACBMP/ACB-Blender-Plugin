@@ -412,6 +412,7 @@ def localize_links(doc: MapDocument, o: Obj, dst_fn: str) -> int:
     not in dst_fn or an always-loaded entry is copied into dst_fn (fresh ids, once per entry) and the link
     redirected. Returns the number of copies made."""
     entries = {e.id & 0xFFFFFFFF for e in doc.entries}
+    entries |= {doc.entry_root(fn) for fn in doc.fnames[len(doc.entries):]}   # added this session (own-entry meshes)
     ok = always_loaded_entries(doc) | {dst_fn}
     memo = doc.__dict__.setdefault("_localized", {})
     made = 0
@@ -596,17 +597,27 @@ def delete_many(doc: MapDocument, keys) -> dict:
     roots = {k[0] for k in keys if k[1] < 0}
     blocks = set(doc.uids("GridCellDataBlock"))
     comps = compounds(doc)
+    # MeshShapes the elements own as separate roots (make_shape_unique): they go too unless something else links them
+    shapes: dict[int, tuple] = {}
+    for k in keys:
+        for _i, ic in inert_components(element_obj(doc, k)):
+            sid = u32(ic.fields["RigidBody"].fields["Shape"].id)
+            if sid in doc.info and sid not in owner:
+                shapes[sid] = k
+    shared = set(shapes) & opaque_references(doc) if shapes else set()
     refused: dict[tuple, str] = {}
     for u in doc.info:
-        if u in roots or u in blocks or u in comps:
+        if u in roots or u in blocks or u in comps or u in shapes:
             continue
         r = doc.root(u)
         if r is None:
             continue
-        for i in linked_ids(r.obj) & owner.keys():
+        ln = linked_ids(r.obj)
+        for i in ln & owner.keys():
             k = owner[i]
             if k[0] != u:   # a group child may be linked from its own group
                 refused.setdefault(k, f"still referenced by {doc.name_of(u)}")
+        shared |= ln & shapes.keys()
     out = {k: refused.get(k) for k in keys}
     go = [k for k in keys if out[k] is None]
     ids = {i for i, k in owner.items() if out[k] is None}
@@ -616,9 +627,27 @@ def delete_many(doc: MapDocument, keys) -> dict:
         del doc.obj(k[0]).fields["Entities"][k[1]]
         doc.touch(k[0])
     gone = {k[0] for k in go if k[1] < 0}
+    gone |= {sid for sid, k in shapes.items() if out[k] is None and sid not in shared}
     _remove_from_blocks(doc, gone)
     doc.remove_roots(gone)
     return out
+
+
+def purge_orphan_shapes(doc: MapDocument) -> list[int]:
+    """Remove MeshShape roots nothing links to (left behind by deletes before delete_many took shapes along). ACB
+    still loads them and compiles a MOPP for each. Returns the removed uids."""
+    shapes = set(doc.uids("MeshShape")) & set(doc.info)
+    used = set(opaque_references(doc))
+    for u in doc.info:
+        if u in shapes:
+            continue
+        r = doc.root(u)
+        if r is not None:
+            used |= linked_ids(r.obj) & shapes
+    gone = shapes - used
+    _remove_from_blocks(doc, gone)
+    doc.remove_roots(gone)
+    return sorted(gone)
 
 
 def opaque_references(doc: MapDocument) -> set[int]:
@@ -1026,16 +1055,87 @@ def visual_template(doc: MapDocument, exclude=frozenset()) -> Obj:
     raise EditError("no Visual with a direct mesh in this map to use as a template")
 
 
+MAX_ENTRIES = 4990   # anvilforge writes up to 5000 entries per FileSet; more needs a multi-FileSet forge (untested)
+
+
+def store_mesh(doc: MapDocument, root: Root, name: str, user_fn: str) -> int:
+    """Store a Mesh root the retail way: alone in its own entry, listed (kind 1) in the dependency table of the
+    entry user_fn whose Visual shows it. ACB does not draw editor meshes kept as roots inside a streamed grid-cell
+    entry (collision in the same entry works); retail stores nearly every mesh so. Returns the mesh uid."""
+    if len(doc.fnames) >= MAX_ENTRIES:
+        raise EditError(f"the forge already has {len(doc.fnames)} entries (limit {MAX_ENTRIES}): merge pieces")
+    fn = doc.add_entry(name, [(root, name)])
+    uid = doc.entry_root(fn)
+    doc.add_dependency(user_fn, uid)
+    return uid
+
+
+def _mesh_key(doc: MapDocument, m: int) -> str:
+    import hashlib
+    o = doc.obj(m)
+    md = o.fields["CompiledMesh"].obj.fields["MeshData"]
+    h = hashlib.sha1(b"".join(md.fields["VertexBufferData"]) + b"|" + b"".join(md.fields["IndexBufferData"]))
+    for r in o.fields.get("CompiledMeshMaterials", []):
+        h.update(bytes(r.id))
+    for p in md.fields["StandardPrimitives"]:
+        h.update(repr(sorted(p.fields.items())).encode())
+    return h.hexdigest()
+
+
+def split_editor_meshes(doc: MapDocument) -> int:
+    """Migrate forges saved by editor versions that kept each editor Mesh inside its user's grid-cell entry (invisible
+    in game): drop editor meshes nothing shows, merge byte-identical ones, and store each in its own entry with a
+    dependency from every entry using it (see store_mesh). Returns the number of meshes moved."""
+    vis = []
+    for u in doc.uids("Entity"):
+        if not is_editor_id(u) or doc.root(u) is None:
+            continue
+        for c in doc.obj(u).fields["Components"]:
+            v = getattr(c, "obj", None)
+            if v is not None and type_name(v.type_hash) == "Visual" and isinstance(v.fields.get("Object"), Ref):
+                vis.append((u, v))
+    shown = {u32(v.fields["Object"].id) for _, v in vis}
+    old = {m for m in doc.uids("Mesh") if is_editor_id(m) and m in doc.where and doc.entry_root(doc.entry_of(m)) != m}
+    if not old:
+        return 0
+    canon, rep = {}, {}
+    for m in sorted(old & shown):
+        rep[m] = canon.setdefault(_mesh_key(doc, m), m)
+    keep = sorted(set(rep.values()))
+    if len(doc.fnames) + len(keep) > MAX_ENTRIES:
+        raise EditError(f"{len(keep)} editor meshes would need own entries: over {MAX_ENTRIES} entries in all")
+    users: dict[int, set[str]] = {}
+    for u, v in vis:
+        m = u32(v.fields["Object"].id)
+        if m not in rep:
+            continue
+        c = rep[m]
+        if c != m:
+            r = v.fields["Object"]
+            v.fields["Object"] = Ref(r.tag, r.extra, idb(c))
+            idata = v.fields["InstanceData"].obj
+            idata.fields["Mesh"] = Ptr(idata.fields["Mesh"].status, idb(c))
+            doc.touch(u)
+        users.setdefault(c, set()).add(doc.entry_of(u))
+    roots = [(m, doc.root(m), doc.name_of(m)) for m in keep]
+    doc.remove_roots(old)
+    for m, r, n in roots:
+        doc.add_entry(n, [(r, n)])
+        for user_fn in users[m]:
+            doc.add_dependency(user_fn, m)
+    return len(roots)
+
+
 def set_visual(doc: MapDocument, key, mesh_input) -> int:
     """Give an element a visual mesh built from mesh_input (acbmap.visual.MeshInput, entity-local), replacing the
-    Visual components it had. The new Mesh root goes into the element's entry. Returns the Mesh uid."""
+    Visual components it had. The new Mesh root gets its own entry (store_mesh). Returns the Mesh uid."""
     import struct
     from . import visual as V
     o = element_obj(doc, key)
     root, mats = V.build_mesh(doc, mesh_input, lambda x: clone_tree(doc, x))
     fn = doc.entry_of(key[0])
     localize_links(doc, root.obj, fn)   # the map materials it uses must load wherever this entry does
-    mesh_uid = doc.add_root(fn, root, f"{doc.name_of(key[0])}_Mesh{u32(root.obj.id) & 0xFFFF:04x}")
+    mesh_uid = store_mesh(doc, root, f"{doc.name_of(key[0])}_Mesh{u32(root.obj.id) & 0xFFFF:04x}", fn)
 
     comp = clone_tree(doc, visual_template(doc))
     tag, extra = comp.fields["Object"].tag, comp.fields["Object"].extra

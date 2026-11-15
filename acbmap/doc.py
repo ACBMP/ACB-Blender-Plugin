@@ -170,8 +170,7 @@ class MapDocument:
         first root's. Returns the loose file name."""
         fname = f"{len(self.fnames)}_-_{name}.data"
         df = DataFile.__new__(DataFile)
-        from anvilforge.datafile import Dependency
-        df.fname, df.deps, df.raw_dep, df.subs = fname, [Dependency(id=d) for d in deps], b"", []
+        df.fname, df.deps, df.raw_dep, df.subs = fname, [], b"", []
         self._files[fname] = df
         self.fnames.append(fname)
         for r, n in roots:
@@ -181,6 +180,8 @@ class MapDocument:
             self.info.setdefault(uid, (r.obj.type_hash, n))
             self._roots.setdefault(uid, r)
         self._reindex_file(fname)
+        for d in deps:
+            self.add_dependency(fname, d)
         self.touched_files.add(fname)
         return fname
 
@@ -243,11 +244,16 @@ class MapDocument:
             del self.where[uid]
 
     def add_dependency(self, fname: str, dep_uid: int) -> None:
+        """List entry dep_uid (the id of its first root) in fname's dependency table. Retail ids are 64-bit with a kind
+        in the high word: 2 for TextureMap entries, 1 for the rest (Mesh, MaterialTemplate, BuildTable, ...). ACB
+        never loads an entry no table lists, and ignores one listed with kind 0."""
+        dep_uid &= 0xFFFFFFFF
         df = self._file(fname)
-        if any(d.id == dep_uid for d in df.deps):
+        if any(d.id & 0xFFFFFFFF == dep_uid for d in df.deps):
             return
         from anvilforge.datafile import Dependency
-        df.deps.append(Dependency(id=dep_uid))
+        kind = 2 if dep_uid in self.info and self.type_of(dep_uid) == "TextureMap" else 1
+        df.deps.append(Dependency(id=kind << 32 | dep_uid))
         self.touched_files.add(fname)
 
     def fresh_id(self, base: int | None = None) -> int:

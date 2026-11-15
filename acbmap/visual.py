@@ -34,6 +34,7 @@ from .doc import MapDocument, idb, u32
 from .kinds import components
 
 POS_SCALE = 1.0 / (1 << 18)
+WORLD_CATEGORY = 0   # Mesh.Category of every retail world mesh; 1 = characters/pickups, which the world renderer skips
 UV_SCALE = 1.0 / 2048
 STATIC_FORMATS = {4: 20, 3: 24}   # VertexFormat -> stride; uv is the last 4 bytes
 DDS_FOURCC = {2: b"DXT1", 3: b"DXT1", 4: b"DXT3", 5: b"DXT5"}
@@ -317,11 +318,12 @@ def encode_static(mi: MeshInput):
 
 
 def static_mesh_template(doc: MapDocument) -> int:
-    """A retail static (VertexFormat 4) Mesh of this map to clone the field layout from."""
+    """A retail static (VertexFormat 4) world Mesh of this map to clone the field layout from. Category 0 only:
+    pickups and characters (Category 1) share the vertex format, but the world renderer skips their meshes."""
     for u in doc.uids("Mesh"):
         o = doc.obj(u)
         cm = getattr(o.fields.get("CompiledMesh"), "obj", None) if o is not None else None
-        if cm is None or not cm.fields["InstancingData"]:
+        if cm is None or not cm.fields["InstancingData"] or u32(o.fields["Category"]) != WORLD_CATEGORY:
             continue
         md = cm.fields["MeshData"]
         if (md.fields["VertexFormat"][0], md.fields["VertexStride"][0]) == (4, 20) and md.fields["StandardPrimitives"] \
@@ -330,12 +332,31 @@ def static_mesh_template(doc: MapDocument) -> int:
     raise ValueError("no static mesh in this map to use as a template")
 
 
+def fix_mesh_categories(doc: MapDocument) -> int:
+    """Editor-made Meshes cloned from a pickup by an earlier editor version carry Category 1 and never render in
+    game (collision still works). Sets them to the world category; returns how many changed."""
+    from .ops import is_editor_id
+    n = 0
+    for u in doc.uids("Mesh"):
+        if not is_editor_id(u):
+            continue
+        o = doc.obj(u)
+        if o is not None and u32(o.fields["Category"]) != WORLD_CATEGORY:
+            o.fields["Category"] = WORLD_CATEGORY.to_bytes(len(o.fields["Category"]), "little")
+            o.fields["UserCategory"] = bytes(len(o.fields["UserCategory"]))
+            doc.touch(u)
+            n += 1
+    return n
+
+
 def build_mesh(doc: MapDocument, mi: MeshInput, clone):
     """A new Mesh root holding mi (not yet added to the document). clone(obj) deep-copies with fresh ids."""
     tmpl = static_mesh_template(doc)
     src = doc.root(tmpl)
     o = clone(src.obj)
     mats = fill_mesh(o, mi, shadows=True)
+    o.fields["Category"] = WORLD_CATEGORY.to_bytes(len(o.fields["Category"]), "little")
+    o.fields["UserCategory"] = bytes(len(o.fields["UserCategory"]))
     o.fields["SubMeshes"] = []
     o.fields["Bones"] = []
     for k in ("FakeMeshGridIndex", "FakeMeshGridCount"):

@@ -120,6 +120,10 @@ def test_written_mesh_round_trips(tmp_path):
         assert all(abs(u - round(u)) < 1e-3 and abs(v - round(v)) < 1e-3 for u, v in g.uvs)
         bv = o.fields["BoundingVolume"].fields
         assert struct.unpack("<3f", bv["Max"]) == (2.0, 2.0, 2.0)
+        # retail layout: the mesh alone in its own entry, listed as a kind-1 dependency by the entity's entry
+        fn = r.entry_of(ms[0])
+        assert r.entry_root(fn) == ms[0] and len(r._file(fn).subs) == 1
+        assert (1 << 32 | ms[0]) in {d.id for d in r._file(r.entry_of(k[0])).deps}
     assert not [c for c in ops.element_obj(r, skey).fields["Components"]
                 if c.obj is not None and type_name(c.obj.type_hash) in ("InertComponent", "GuidanceSystem")]
     assert new_problems(r, MapDocument(MAP)) == []

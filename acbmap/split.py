@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from .visual import MAX_UV, MeshInput
 
 MAX_TRIS = 20000          # 3 corners each stays under 65535 vertices, whatever is shared
+# Collision pieces have no stored MOPP, so ACB compiles one at load (hkpMoppUtility::buildCode) with a scratch
+# buffer of 244 bytes per triangle from ScimitarHavokTempAllocator. Its bump check `cur + size <= end` is 32-bit
+# unsigned; with the temp buffer near the top of the address space (Wine puts it at 0xffe7xxxx) a request over the
+# ~1.6 MB left wraps, passes, and Havok writes past the buffer (crash at ACBMP.exe 0x01a26b92 on a 9230-tri piece).
+# 4000 triangles = 0.98 MB; smaller requests that don't fit fail the check honestly and go to the heap.
+MAX_COLLISION_TRIS = 4000
 MAX_SIZE = 64.0           # metres: culling, MOPP size and position precision (2 mm at 64 m)
 MAX_UV_SPAN = MAX_UV - 1  # tiles, after the encoder's integer offset
 

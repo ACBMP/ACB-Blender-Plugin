@@ -13,6 +13,7 @@ from .doc import MapDocument, u32
 from .geom import mesh_shape_geometry
 from .kinds import block_membership, classify
 from .ops import RUNTIME_ID_BASE, is_editor_id
+from .split import MAX_COLLISION_TRIS
 
 
 def check_alignment(forge_path: str) -> list[str]:
@@ -119,6 +120,9 @@ def check_mesh_shapes(doc: MapDocument) -> list[str]:
             out.append(f"collision: {doc.name_of(u)} uses material {max(m)} of {len(o.fields['Materials'])}")
         if not o.fields["MoppCode"] and o.fields["MoppCodeVersionNumber"] == (5).to_bytes(4, "little"):
             out.append(f"collision: {doc.name_of(u)} has no MOPP but claims version 5 (ACB would trust it)")
+        if not o.fields["MoppCode"] and len(t) > MAX_COLLISION_TRIS:
+            out.append(f"collision: {doc.name_of(u)} has {len(t)} triangles and no MOPP; ACB's load-time MOPP "
+                       f"build crashes above ~6600 (keep under {MAX_COLLISION_TRIS})")
     return out
 
 
