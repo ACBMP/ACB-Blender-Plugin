@@ -281,7 +281,7 @@ def encode_static(mi: MeshInput):
         by_mat.setdefault(m, []).append(ti)
     tan, sign = _tangents(mi)
     extent = max(abs(c) for v in mi.verts for c in v)
-    w = 8 * max(1, math.ceil(extent + 1e-6))
+    w = 8 * max(1, math.ceil(extent + 1e-3))   # an extent just under k m (4.99998) rounded to 32768
     if w > 32767:
         raise ValueError("mesh is larger than 4 km")
     scale = (1 << 18) / w
