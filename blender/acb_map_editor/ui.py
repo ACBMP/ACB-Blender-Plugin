@@ -264,28 +264,69 @@ class ACB_OT_add_element(bpy.types.Operator):
         except ops.EditError as ex:
             self.report({"ERROR"}, str(ex))
             return {"CANCELLED"}
-        o = ops.element_obj(s.doc, nk)
-        e = Element(kind_of(o, type_name(o.type_hash) == "EntityGroup"), nk[0], o, -1,
-                    [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
-        ob = s._element_object(e)
-        if type_name(o.type_hash) == "EntityGroup":
-            from acbmap.kinds import group_children
-            for i, c in enumerate(group_children(o)):
-                ce = Element(kind_of(c), nk[0], c, i, [n for n, _ in components(c)], e.block)
-                cob = s._element_object(ce)
-                if cob is not None:
-                    cob.parent = ob
-                    cob.matrix_parent_inverse = ob.matrix_world.inverted()
-        if e.kind == "chest_spawn":
-            s.wd.sync_chests()
-        s.snapshot()
-        for x in context.selected_objects:
-            x.select_set(False)
-        if ob is not None:
-            ob.select_set(True)
-            context.view_layer.objects.active = ob
-        self.report({"INFO"}, f"added {ob.name if ob else nk}")
-        return {"FINISHED"}
+        return _show_added(self, context, s, nk)
+
+
+def _show_added(op, context, s, nk):
+    """Blender objects of a new root element (a group with its children), selected."""
+    o = ops.element_obj(s.doc, nk)
+    e = Element(kind_of(o, type_name(o.type_hash) == "EntityGroup"), nk[0], o, -1,
+                [n for n, _ in components(o)], ops.owning_block(s.doc, nk[0]))
+    ob = s._element_object(e)
+    if type_name(o.type_hash) == "EntityGroup":
+        from acbmap.kinds import group_children
+        for i, c in enumerate(group_children(o)):
+            ce = Element(kind_of(c), nk[0], c, i, [n for n, _ in components(c)], e.block)
+            cob = s._element_object(ce)
+            if cob is not None:
+                cob.parent = ob
+                cob.matrix_parent_inverse = ob.matrix_world.inverted()
+    if e.kind == "chest_spawn":
+        s.wd.sync_chests()
+    s.snapshot()
+    for x in context.selected_objects:
+        x.select_set(False)
+    if ob is not None:
+        ob.select_set(True)
+        context.view_layer.objects.active = ob
+    op.report({"INFO"}, f"added {ob.name if ob else nk}")
+    return {"FINISHED"}
+
+
+class ACB_OT_copy_from_map(bpy.types.Operator):
+    """Copy an element (hiding haystack, chase breaker, prop, ...) from another map forge to the 3D cursor, with
+    the meshes, textures, effects and animation it uses"""
+    bl_idname = "acb.copy_from_map"
+    bl_label = "Copy From Map"
+    bl_options = {"REGISTER"}
+    filepath: bpy.props.StringProperty(name="Map forge", subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.forge", options={"HIDDEN"})
+    element: bpy.props.StringProperty(name="Element", default="AC2MP_GEN_HayStack_01X_Group",
+                                      description="Name of the element in that map, or how it starts")
+
+    def invoke(self, context, event):
+        s = sess(context)
+        if s is not None and not self.filepath:
+            self.filepath = s.multi_dir + os.sep
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        from acbmap import transfer
+        s = sess(context)
+        s.sync()
+        try:
+            src = MapDocument(bpy.path.abspath(self.filepath))
+            u = transfer.find(src, self.element)
+            m = Matrix(S.to_blender(src.obj(u).fields["GlobalMatrix"]))
+            m.translation = context.scene.cursor.location
+            nk, st = transfer.copy_element(s.doc, src, u, from_blender(m))
+        except (ops.EditError, OSError, ValueError) as ex:
+            self.report({"ERROR"}, str(ex))
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"{src.name_of(u)}: {st['entries'] + st['roots']} resources copied, "
+                              f"{st['kept']} already here")
+        return _show_added(self, context, s, nk)
 
 
 def _import_meshes(op, context, collision: bool, visible: bool):
@@ -1300,6 +1341,7 @@ class ACB_PT_tools(ACBPanel, bpy.types.Panel):
     def draw(self, context):
         col = self.layout.column(align=True)
         col.operator("acb.add_element", icon="ADD")
+        col.operator("acb.copy_from_map", icon="IMPORT")
         col.label(text="Shift+D copies an element, X deletes it (on Apply)")
         col.separator()
         vis = s.collision_visible() if (s := sess(context)) is not None else True
@@ -1548,7 +1590,7 @@ class ACB_PT_inspector(ACBPanel, bpy.types.Panel):
 
 
 CLASSES = (ACB_OT_open_map, ACB_OT_close_map, ACB_OT_toggle_collision, ACB_OT_reconnect, ACB_OT_apply, ACB_OT_save, ACB_OT_install, ACB_OT_uninstall,
-           ACB_OT_add_element, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_edit_boundary, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
+           ACB_OT_add_element, ACB_OT_copy_from_map, ACB_OT_new_collision, ACB_OT_new_scenery, ACB_OT_clear_scenery, ACB_OT_edit_boundary, ACB_OT_replace_visual, ACB_OT_make_unique, ACB_OT_generate_climb, ACB_OT_toggle_climb,
            ACB_OT_strip_guidance,
            ACB_OT_spawn_add, ACB_OT_spawn_set, ACB_OT_spawn_drop, ACB_OT_spawn_show,
            ACB_OT_toggle_navmesh, ACB_OT_toggle_escort, ACB_OT_edit_flow,

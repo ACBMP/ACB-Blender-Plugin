@@ -86,6 +86,10 @@ They read a real map, `$ACB_MULTI` (default: the vbox install path).
      one connected piece. See [Editing the out-of-bounds boundary](#editing-the-out-of-bounds-boundary).
    - **Add Element**: places a copy of one of the map's own spawns, benches, haystacks, chase breakers, etc. at
      the 3D cursor.
+   - **Copy From Map**: places a copy of an element of another map forge (by name, e.g. San Donato's hiding
+     haystack `AC2MP_GEN_HayStack_01X_Group`) at the 3D cursor, with the meshes, textures, shapes, skeleton,
+     animation and effects it uses (`acbmap/transfer.py`). Skinned meshes (the hay itself) aren't drawn in
+     Blender; the element shows by its collision.
    - **Spawns** (panel): spawn counts per kind (free-for-all, Team 1-4, Chest), each with an eye to show only the
      kinds you're working on and a **+** that adds one at the 3D cursor (Shift+right-click places the cursor),
      facing the way the view looks. Spawns are drawn as figures coloured by kind, with arrows the way the player

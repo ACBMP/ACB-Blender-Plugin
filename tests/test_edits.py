@@ -314,3 +314,52 @@ def test_delete_takes_own_shape_along(tmp_path):
     d2 = reopen(d, tmp_path)
     assert k[0] not in d2.info and sid not in d2.info
     assert ops.purge_orphan_shapes(d2) == []   # retail shapes are all still in use
+
+
+def test_copy_element_from_another_map(tmp_path):
+    """A San Donato hiding haystack (a group: haystack entity + cart collision) copied in twice: its resources come
+    along once, the copies have their own ids, and their ResetData follows ids and position."""
+    import struct
+    from anvilforge.fastload import walk
+    from acbmap import transfer
+    from acbmap.checks import new_problems
+    other = os.path.join(MULTI, "DataPC_AC2MP_SanDonato.forge")
+    if not os.path.exists(other):
+        pytest.skip("needs San Donato")
+    d, src = MapDocument(MAP), MapDocument(other)
+    u = transfer.find(src, "AC2MP_GEN_HayStack_01X_Group")
+    need = transfer.resources(src, src.obj(u))
+    assert {src.type_of(r) for r in need} >= {"Mesh", "Material", "TextureMap", "Skeleton", "Animation", "FX"}
+    m = src.obj(u).fields["GlobalMatrix"]
+    k1, st1 = transfer.copy_element(d, src, u, set_position(m, (3.0, 4.0, 30.0)))
+    k2, st2 = transfer.copy_element(d, src, u, set_position(m, (9.0, 4.0, 30.0)))
+    assert st1["entries"] + st1["roots"] > 0 and st2["entries"] + st2["roots"] == 0
+    d2 = reopen(d, tmp_path)
+    assert new_problems(d2, MapDocument(MAP)) == []
+    seen = set()
+    for k, pos in ((k1, (3.0, 4.0, 30.0)), (k2, (9.0, 4.0, 30.0))):
+        g = d2.obj(k[0])
+        # every resource is there, in the level-1 cell over the copy (or an always-loaded entry)
+        area = ops.area_block(d2, ops.owning_block(d2, k[0]))
+        assert area != ops.owning_block(d2, k[0])
+        here = ops.always_loaded_entries(d2) | {d2.entry_of(area)}
+        listed = {x.id & 0xFFFFFFFF for fn in here for x in d2._file(fn).deps}
+        for r in need:
+            assert r in d2.info and (r in listed or any(fn in here for fn, _ in d2.where[r])), d2.name_of(r)
+        kinds = [e.kind for e in classify(d2) if e.uid == k[0]]
+        assert "haystack" in kinds
+        assert position(g.fields["GlobalMatrix"]) == pos
+        mk = ops.marker_of(d2, k[0])    # its map marker, as every retail hiding stack has
+        assert mk is not None and struct.unpack("<3f", mk[2].fields["MarkerPosition"][:12]) == pos
+        own = {u32(o.id) for o in walk(g)} - {0}
+        assert not own & seen and not own & {u32(o.id) for o in walk(src.obj(u))}
+        seen |= own
+        for o in [g] + group_children(g):
+            rd = ops._reset_data(o)
+            if rd is None:
+                continue
+            data = b"".join(rd.fields["DataBuffer"])
+            props = ops.reset_properties(rd)
+            assert props and all(oid in own for _t, oid, _h, _off in props)
+            t, _oid, _h, off = props[0]
+            assert t == 0x41 and struct.unpack_from("<16f", data, off)[3::4][:3] == position(o.fields["GlobalMatrix"])

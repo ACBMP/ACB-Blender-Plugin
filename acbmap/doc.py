@@ -185,6 +185,38 @@ class MapDocument:
         self.touched_files.add(fname)
         return fname
 
+    def add_raw(self, fname: str, type_hash_: int, name: str, payload: bytes) -> int:
+        """Add an already encoded root (e.g. taken from another map, its id kept) to an existing entry. The same
+        root may be stored in several entries (retail does: each copy loads with its entry)."""
+        uid = DataFile.uid(payload)
+        if any(fn == fname for fn, _ in self.where.get(uid, [])):
+            return uid
+        self._file(fname).subs.append([type_hash_, name, payload])
+        self.where.setdefault(uid, []).append((fname, len(self._file(fname).subs) - 1))
+        self.info.setdefault(uid, (type_hash_, name))
+        self.touched_files.add(fname)
+        if hasattr(self, "_used"):
+            del self._used
+        return uid
+
+    def add_raw_entry(self, name: str, subs: list[tuple[int, str, bytes]], deps=()) -> str:
+        """A new forge entry of already encoded roots [(type hash, object name, payload)]; `deps`: the 64-bit ids
+        of its dependency table. Returns the loose file name."""
+        from anvilforge.datafile import Dependency
+        fname = f"{len(self.fnames)}_-_{name}.data"
+        df = DataFile.__new__(DataFile)
+        df.fname, df.deps, df.raw_dep, df.subs = fname, [Dependency(id=d) for d in deps], b"", []
+        self._files[fname] = df
+        self.fnames.append(fname)
+        for t, n, payload in subs:
+            df.subs.append([t, n, payload])
+            self.info.setdefault(DataFile.uid(payload), (t, n))
+        self._reindex_file(fname)
+        self.touched_files.add(fname)
+        if hasattr(self, "_used"):
+            del self._used
+        return fname
+
     def set_entry_roots(self, fname: str, roots: list[tuple[Root, str]]) -> None:
         """Replace every object of an existing entry (keeps its dependency table)."""
         df = self._file(fname)

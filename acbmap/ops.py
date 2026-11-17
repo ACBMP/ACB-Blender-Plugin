@@ -83,6 +83,17 @@ def fresh_ids(doc: MapDocument, n: int) -> list[int]:
             raise EditError("this world's id range is exhausted")
 
 
+def reserve_ids(doc: MapDocument, payload: bytes) -> None:
+    """Ids of an encoded root added to the document (doc.add_raw): fresh_ids won't hand them out."""
+    ids = all_ids(doc)
+    ids.add(DataFile.uid(payload))
+    hi = (id_base(doc) >> 16).to_bytes(2, "little")
+    p = payload.find(hi, 2)
+    while p >= 0:
+        ids.add(u32(payload[p - 2:p + 2]))
+        p = payload.find(hi, p + 1)
+
+
 def migrate_runtime_ids(doc: MapDocument) -> int:
     """Renumber objects an earlier editor version gave ids in the engine's runtime range (>= 0xF0000000) into the
     editor range, with every link to them. Returns the number of ids changed."""
@@ -261,18 +272,94 @@ def set_matrix(doc: MapDocument, key, m: bytes) -> None:
     """Set an element's GlobalMatrix. Moving a group root carries its children along (they store world matrices)."""
     uid, child = key
     o = element_obj(doc, key)
+    if o.fields["GlobalMatrix"] == m:
+        return
+    ensure_standalone(doc, key)
+    place(o, m)
+    doc.touch(uid)
+    mk = marker_of(doc, uid) if child < 0 else None
+    if mk is not None:
+        _marker_position(mk[2], m)
+        doc.touch(mk[0])
+
+
+def place(o: Obj, m: bytes) -> None:
+    """GlobalMatrix of an entity or group tree (not yet / already in a document): a group's children follow, and
+    each one's ResetData follows too."""
     old = o.fields["GlobalMatrix"]
     if old == m:
         return
-    ensure_standalone(doc, key)
-    o.fields["GlobalMatrix"] = m
-    if child < 0 and type_name(o.type_hash) == "EntityGroup":
+    _set_entity_matrix(o, m)
+    if type_name(o.type_hash) == "EntityGroup":
         # row-vector convention: world = local * M  ->  new_child = child * inv(old) * new
         delta = _mul(_inv(matrix_rows(old)), matrix_rows(m))
         for c in group_children(o):
             nm = _mul(matrix_rows(c.fields["GlobalMatrix"]), delta)
-            c.fields["GlobalMatrix"] = pack_floats([x for row in nm for x in row])
-    doc.touch(uid)
+            _set_entity_matrix(c, pack_floats([x for row in nm for x in row]))
+
+
+# ------------------------------------------------------------------ reset data --
+#
+# Entity.ResetData (GameStateData; by its name, the state the game puts back on a reset): DescBuffer = u32 1, then per
+# property [u8 1][u8 type][u32 object id][u32 property name hash]; DataBuffer = u32 1, then the values in order.
+# Types (all 1056 in four retail maps): 0x01 bool (1 byte), 0x35 vector (16), 0x41 matrix (64, the transpose of
+# the field's layout). Every entity with one stores its own GlobalMatrix there (and a RigidBodyComponent's
+# EntityInitTransform, the same matrix): an element copied or moved without it snaps back / keeps foreign ids.
+
+RESET_SIZES = {0x01: 1, 0x35: 16, 0x41: 64}
+
+
+def _reset_data(o: Obj) -> Obj | None:
+    p = o.fields.get("ResetData")
+    rd = getattr(p, "obj", None)
+    return rd if rd is not None and "DescBuffer" in rd.fields else None
+
+
+def reset_properties(rd: Obj) -> list[tuple[int, int, int, int]] | None:
+    """[(type, object id, property hash, offset of the value in DataBuffer)], None if the layout isn't understood."""
+    desc, n = b"".join(rd.fields["DescBuffer"]), u32(rd.fields["PropertyCount"])
+    if len(desc) != 4 + 10 * n:
+        return None
+    out, off = [], 4
+    for k in range(n):
+        t = desc[5 + 10 * k]
+        if t not in RESET_SIZES:
+            return None
+        out.append((t, u32(desc[6 + 10 * k:10 + 10 * k]), u32(desc[10 + 10 * k:14 + 10 * k]), off))
+        off += RESET_SIZES[t]
+    return out if off == len(rd.fields["DataBuffer"]) else None
+
+
+def _transpose(m: bytes) -> bytes:
+    return b"".join(m[4 * (4 * c + r):4 * (4 * c + r) + 4] for r in range(4) for c in range(4))
+
+
+def _set_entity_matrix(o: Obj, m: bytes) -> None:
+    """GlobalMatrix, and every ResetData matrix that held the old one."""
+    import struct
+    old = struct.unpack("<16f", _transpose(o.fields["GlobalMatrix"]))
+    o.fields["GlobalMatrix"] = m
+    rd = _reset_data(o)
+    props = reset_properties(rd) if rd is not None else None
+    if not props:
+        return
+    data = bytearray(b"".join(rd.fields["DataBuffer"]))
+    for t, _oid, _h, off in props:
+        if t == 0x41 and all(abs(a - b) < 1e-3 for a, b in zip(struct.unpack_from("<16f", data, off), old)):
+            data[off:off + 64] = _transpose(m)
+    rd.fields["DataBuffer"] = [bytes([b]) for b in data]
+
+
+def _remap_reset_ids(rd: Obj, mapping: dict[int, int]) -> None:
+    desc = bytearray(b"".join(rd.fields["DescBuffer"]))
+    n = u32(rd.fields["PropertyCount"])
+    if len(desc) != 4 + 10 * n:
+        return
+    for k in range(n):
+        i = u32(desc[6 + 10 * k:10 + 10 * k])
+        if i in mapping:
+            desc[6 + 10 * k:10 + 10 * k] = idb(mapping[i])
+    rd.fields["DescBuffer"] = [bytes([b]) for b in desc]
 
 
 def set_field(doc: MapDocument, key, path: list, value) -> None:
@@ -296,6 +383,46 @@ def set_field(doc: MapDocument, key, path: list, value) -> None:
     doc.touch(key[0])
 
 
+# ------------------------------------------------------------------ map markers --
+#
+# MapWorldInfo.PermanentMarkers holds a MapMarker for every bench and every hiding stack group of the retail maps
+# (all 34 + 20 of San Donato, 48 + 18 of Alhambra): MarkerType as in the element's MapMarkerComponent, Key.Entity =
+# the root element, MarkerPosition = its position. A copy gets its own; a moved element's follows.
+
+def marker_of(doc: MapDocument, uid: int):
+    """(MapWorldInfo uid, index in PermanentMarkers, MapMarker) of root element `uid`, or None."""
+    for w in doc.uids("MapWorldInfo"):
+        o = doc.obj(w)
+        for i, p in enumerate(o.fields.get("PermanentMarkers", []) if o is not None else []):
+            m = getattr(p, "obj", None)
+            key = m.fields.get("Key") if m is not None else None
+            h = key.fields.get("Entity") if isinstance(key, Obj) else None
+            if isinstance(h, Handle) and u32(h.id) == uid:
+                return w, i, m
+    return None
+
+
+def _marker_position(m: Obj, matrix: bytes) -> None:
+    if "MarkerPosition" in m.fields:
+        m.fields["MarkerPosition"] = matrix[48:60] + m.fields["MarkerPosition"][12:]
+
+
+def add_marker(doc: MapDocument, template: Obj, uid: int, matrix: bytes) -> bool:
+    """A copy of MapMarker `template` (of this or another map) for root element `uid` at `matrix`. False when the
+    map has no MapWorldInfo."""
+    for w in doc.uids("MapWorldInfo"):
+        o = doc.obj(w)
+        if o is None or "PermanentMarkers" not in o.fields:
+            continue
+        m = clone_tree(doc, template)
+        m.fields["Key"].fields["Entity"] = Handle(m.fields["Key"].fields["Entity"].tag, idb(uid))
+        _marker_position(m, matrix)
+        o.fields["PermanentMarkers"] = o.fields["PermanentMarkers"] + [Ptr(0, None, m)]
+        doc.touch(w)
+        return True
+    return False
+
+
 # ------------------------------------------------------------------ duplicate --
 
 def _remap_ids(obj: Obj, mapping: dict[int, int]) -> None:
@@ -308,6 +435,8 @@ def _remap_ids(obj: Obj, mapping: dict[int, int]) -> None:
                 v.fields[k] = fix(x)
             if v.dyn:
                 v.dyn = [(a, b, c, fix(d)) for a, b, c, d in v.dyn]
+            if "DescBuffer" in v.fields and "PropertyCount" in v.fields:
+                _remap_reset_ids(v, mapping)    # ResetData names its entity and components by id
             return v
         if isinstance(v, Ptr):
             if v.obj is not None:
@@ -347,7 +476,7 @@ def duplicate(doc: MapDocument, key, matrix: bytes | None = None, block: int | N
     src = element_obj(doc, key)
     new = clone_tree(doc, src)
     if matrix is not None:
-        new.fields["GlobalMatrix"] = matrix
+        place(new, matrix)
     unmerge(new)    # a copy isn't in its source's compound: merged, it would have no collision
     for c in group_children(new) if type_name(new.type_hash) == "EntityGroup" else ():
         unmerge(c)
@@ -361,6 +490,7 @@ def duplicate(doc: MapDocument, key, matrix: bytes | None = None, block: int | N
         copy_deps(doc, doc.entry_of(uid), fn, new)
         activate(doc, block, [nuid])
         doc.touch(nuid)   # the copy is edited further by callers: re-encode it on save
+        _copy_marker(doc, uid, nuid)
         return (nuid, -1)
     if child >= 0:
         g = doc.obj(uid)
@@ -378,7 +508,14 @@ def duplicate(doc: MapDocument, key, matrix: bytes | None = None, block: int | N
         raise EditError("source root does not live in its block's entry")
     activate(doc, blk, [nuid])
     doc.touch(nuid)   # the copy is edited further by callers: re-encode it on save
+    _copy_marker(doc, uid, nuid)
     return (nuid, -1)
+
+
+def _copy_marker(doc: MapDocument, uid: int, nuid: int) -> None:
+    mk = marker_of(doc, uid)
+    if mk is not None:
+        add_marker(doc, mk[2], nuid, doc.obj(nuid).fields["GlobalMatrix"])
 
 
 def linked_ids(o: Obj) -> set[int]:
@@ -503,6 +640,22 @@ def cell_block(doc: MapDocument, x: float, y: float) -> int:
         for b in doc.uids("GridCellDataBlock"):
             if doc.name_of(b) == name and doc.entry_root(doc.entry_of(b)) == b:
                 return b
+    return top_block(doc)
+
+
+def area_block(doc: MapDocument, blk: int) -> int:
+    """The level-1 GridCellDataBlock over level-0 cell block `blk` (2 x 2 cells; numbered after the level-0 cells,
+    row by row): where retail keeps what the elements of its cells share (materials, shapes, skeletons, effects,
+    with the mesh/texture entries in its dependency table). top_block when there is none."""
+    g = grid_layout(doc)
+    n_ = doc.name_of(blk)
+    if g is not None and n_.startswith("Cell") and n_.endswith("_DataBlock") and n_[4:-10].isdigit():
+        n, i = g[3], int(n_[4:-10])
+        if i < n * n and n % 2 == 0:
+            name = f"Cell{n * n + (i // n // 2) * (n // 2) + (i % n) // 2:05d}_DataBlock"
+            for b in doc.uids("GridCellDataBlock"):
+                if doc.name_of(b) == name and doc.entry_root(doc.entry_of(b)) == b:
+                    return b
     return top_block(doc)
 
 
