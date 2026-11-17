@@ -103,13 +103,18 @@ def test_written_mesh_round_trips(tmp_path):
     src = box_input(mats)
     tmpl = next(e for e in classify(doc, with_children=False) if e.kind == "collision")
     m = tmpl.obj.fields["GlobalMatrix"]
-    key = ops.new_collision(doc, m, src.verts, [t for t in src.tris], [0] * len(src.tris))
-    ops.set_visual(doc, key, src)
+    ckey = ops.new_collision(doc, m, src.verts, [t for t in src.tris], [0] * len(src.tris))
+    key = ops.drawn_visual(doc, ckey, src)   # the collision stays in its streamed cell, a twin shows the mesh
+    assert key != ckey
     skey = ops.new_scenery(doc, m, src)
     out = tmp_path / os.path.basename(MAP)
     doc.save(str(out))
     r = MapDocument(str(out))
+    top = ops.scenery_block(r)
+    assert ops.owning_block(r, ckey[0]) != top and not V.entity_meshes(r, ops.element_obj(r, ckey))
+    assert ops.inert_components(ops.element_obj(r, ckey))
     for k in (key, skey):
+        assert ops.owning_block(r, k[0]) == top
         o = ops.element_obj(r, k)
         ms = V.entity_meshes(r, o)
         assert len(ms) == 1
@@ -124,6 +129,30 @@ def test_written_mesh_round_trips(tmp_path):
         fn = r.entry_of(ms[0])
         assert r.entry_root(fn) == ms[0] and len(r._file(fn).subs) == 1
         assert (1 << 32 | ms[0]) in {d.id for d in r._file(r.entry_of(k[0])).deps}
-    assert not [c for c in ops.element_obj(r, skey).fields["Components"]
-                if c.obj is not None and type_name(c.obj.type_hash) in ("InertComponent", "GuidanceSystem")]
+    for k in (key, skey):
+        assert not [c for c in ops.element_obj(r, k).fields["Components"]
+                    if c.obj is not None and type_name(c.obj.type_hash) in ("InertComponent", "GuidanceSystem")]
     assert new_problems(r, MapDocument(MAP)) == []
+
+
+def test_streamed_cell_visuals_rehomed(tmp_path):
+    """Forges of earlier versions showed editor meshes from streamed cells (invisible in game): on open, each gets a
+    visual-only twin in the whole-map cell; collision stays put, visual-only originals go."""
+    from acbmap.checks import check_editor_visuals
+    doc = MapDocument(MAP)
+    mats = [m for m in doc.uids("Material")][:2]
+    src = box_input(mats)
+    tmpl = next(e for e in classify(doc, with_children=False) if e.kind == "collision")
+    m = tmpl.obj.fields["GlobalMatrix"]
+    ckey = ops.new_collision(doc, m, src.verts, [t for t in src.tris], [0] * len(src.tris))
+    ops.set_visual(doc, ckey, src)                                  # the old layout
+    vkey = ops.new_scenery(doc, m, src, block=ops.owning_block(doc, ckey[0]))
+    assert len(check_editor_visuals(doc)) == 2
+    assert ops.rehome_editor_visuals(doc) == 2
+    assert check_editor_visuals(doc) == [] and ops.rehome_editor_visuals(doc) == 0
+    assert vkey[0] not in doc.info
+    assert not V.entity_meshes(doc, ops.element_obj(doc, ckey)) and ops.inert_components(ops.element_obj(doc, ckey))
+    out = tmp_path / os.path.basename(MAP)
+    doc.save(str(out))
+    from acbmap.checks import new_problems
+    assert new_problems(MapDocument(str(out)), MapDocument(MAP)) == []
