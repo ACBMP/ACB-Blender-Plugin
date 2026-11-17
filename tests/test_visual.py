@@ -68,10 +68,24 @@ def test_textures_are_dds(doc):
     assert n > 20
 
 
-def test_skinned_meshes_skipped(doc):
+def test_skinned_meshes_decode(doc):
+    """Format 0 (32-byte vertices): bind pose, unit normals, bone indices within Mesh.Bones, weights summing 255."""
     skinned = [m for m in doc.uids("Mesh")
                if doc.obj(m).fields["CompiledMesh"].obj.fields["MeshData"].fields["VertexFormat"][0] == 0]
-    assert skinned and all(V.mesh_geometry(doc, m) is None for m in skinned)
+    assert skinned
+    for m in skinned:
+        g = V.mesh_geometry(doc, m)
+        assert g is not None and g.tris and len(g.verts) == len(g.normals) == len(g.uvs)
+        lo, hi = bbox(g.verts)
+        assert max(hi[k] - lo[k] for k in range(3)) < 20.0
+        assert all(abs(sum(c * c for c in n) - 1.0) < 0.1 for n in g.normals)
+        o = doc.obj(m)
+        md = o.fields["CompiledMesh"].obj.fields["MeshData"]
+        vb = b"".join(md.fields["VertexBufferData"])
+        for i in range(0, len(vb), 32):
+            assert sum(vb[i + 28:i + 32]) == 255
+            assert all(vb[i + 24 + k] < max(len(o.fields["Bones"]), 1) for k in range(4) if vb[i + 28 + k])
+
 
 
 def box_input(materials):

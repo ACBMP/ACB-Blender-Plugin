@@ -37,6 +37,13 @@ POS_SCALE = 1.0 / (1 << 18)
 WORLD_CATEGORY = 0   # Mesh.Category of every retail world mesh; 1 = characters/pickups, which the world renderer skips
 UV_SCALE = 1.0 / 2048
 STATIC_FORMATS = {4: 20, 3: 24}   # VertexFormat -> stride; uv is the last 4 bytes
+# Skinned meshes (characters, horses, elevators, the hiding stacks' hay): format 0, 32 bytes: position 3 x int16 in
+# units of 10 m / 32768 (the 4th is not a scale as in the static formats), normal / tangent / binormal 4 bytes
+# each, uv 2 x int16 at 20, 4 bone indices (into Mesh.Bones) at 24, 4 bone weights (sum 255) at 28. Checked on
+# all 166 of San Donato's: unit normals, indices < bone count, weights sum 255, people 1.6 m tall.
+SKINNED_FORMATS = {0: 32}
+SKINNED_POS_SCALE = 10.0 / 32768
+SKINNED_UV_OFFSET = 20
 DDS_FOURCC = {2: b"DXT1", 3: b"DXT1", 4: b"DXT3", 5: b"DXT5"}
 
 
@@ -83,7 +90,7 @@ def entity_meshes(doc: MapDocument, entity) -> list[int]:
 
 
 def mesh_geometry(doc: MapDocument, mesh_uid: int) -> MeshGeometry | None:
-    """Decoded triangles of a static Mesh, or None for skinned/unknown vertex formats."""
+    """Decoded triangles of a Mesh (a skinned one in its bind pose), or None for unknown vertex formats."""
     o = doc.obj(mesh_uid)
     if o is None:
         return None
@@ -93,7 +100,8 @@ def mesh_geometry(doc: MapDocument, mesh_uid: int) -> MeshGeometry | None:
         return None
     md = cm.fields["MeshData"]
     fmt, stride = md.fields["VertexFormat"][0], md.fields["VertexStride"][0]
-    if STATIC_FORMATS.get(fmt) != stride:
+    skinned = SKINNED_FORMATS.get(fmt) == stride
+    if not skinned and STATIC_FORMATS.get(fmt) != stride:
         return None
     vb = b"".join(md.fields["VertexBufferData"])
     ib = b"".join(md.fields["IndexBufferData"])
@@ -106,10 +114,10 @@ def mesh_geometry(doc: MapDocument, mesh_uid: int) -> MeshGeometry | None:
         idx = struct.unpack(f"<{len(ib) // 2}H", ib)
 
     verts, normals, uvs = [], [], []
-    uv_off = stride - 4
+    uv_off = SKINNED_UV_OFFSET if skinned else stride - 4
     for i in range(0, n * stride, stride):
         x, y, z, w = struct.unpack_from("<4h", vb, i)
-        s = abs(w) * POS_SCALE
+        s = SKINNED_POS_SCALE if skinned else abs(w) * POS_SCALE
         verts.append((x * s, y * s, z * s))
         nx, ny, nz = vb[i + 8], vb[i + 9], vb[i + 10]
         normals.append(((nx - 127.5) / 127.5, (ny - 127.5) / 127.5, (nz - 127.5) / 127.5))
