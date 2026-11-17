@@ -343,12 +343,15 @@ def _import_meshes(op, context, collision: bool, visible: bool):
             continue
         base = ob.name
         bpy.data.objects.remove(ob)
-        suffix = "_col" if collision else "_vis"
-        made += [(k, base + suffix if len(keys) == 1 else f"{base}{suffix}{i:03d}") for i, k in enumerate(keys)]
+        kinds = ["_col" if ops.inert_components(ops.element_obj(s.doc, k)) else "_vis" for k in keys]
+        one = {x: kinds.count(x) == 1 for x in kinds}
+        made += [(k, base + x if one[x] else f"{base}{x}{kinds[:i].count(x):03d}") for i, (k, x) in
+                 enumerate(zip(keys, kinds))]
     edges = 0
-    if collision and getattr(op, "climb", False) and made:
+    solid = [k for k, _n in made if ops.inert_components(ops.element_obj(s.doc, k))]
+    if collision and getattr(op, "climb", False) and solid:
         world = s.world_collision()   # once, with every new piece in it
-        for k, _n in made:
+        for k in solid:
             try:
                 edges += G.regenerate(s.doc, k, ops.fresh_ids, world=world)
             except ValueError as ex:
@@ -440,15 +443,17 @@ class ACB_OT_replace_visual(bpy.types.Operator):
         el = bpy.data.objects.get(s.objects.get(target["acb_key"], "")) or target
         to_entity = el.matrix_world.inverted() @ src[0].matrix_world
         try:
-            ops.set_visual(s.doc, key, s.mesh_input(src[0], to_entity))
+            nk = ops.drawn_visual(s.doc, key, s.mesh_input(src[0], to_entity))
         except (ops.EditError, ValueError) as ex:
             self.report({"ERROR"}, str(ex))
             return {"CANCELLED"}
-        if s.replace_element_visual(key) is None:
+        if nk != key:   # shown by a visual-only twin in the whole-map cell (the game draws it only there)
+            s.show_new_element(nk, f"{el.name}_vis")
+        elif s.replace_element_visual(key) is None:
             self.report({"WARNING"}, "written; reopen the map to see it on this element")
         bpy.data.objects.remove(src[0])
         s.snapshot()
-        self.report({"INFO"}, f"{el.name}: new visual mesh")
+        self.report({"INFO"}, f"{el.name}: new visual mesh" + (f" (on {el.name}_vis)" if nk != key else ""))
         return {"FINISHED"}
 
 

@@ -627,9 +627,10 @@ def grid_layout(doc: MapDocument) -> tuple[float, float, float, int] | None:
 
 def cell_block(doc: MapDocument, x: float, y: float) -> int:
     """The level-0 GridCellDataBlock covering world point (x, y) (the grid's edge cells cover everything beyond it):
-    where retail activates every building, and where new elements go. Elements in the whole-map cell (top_block)
-    load, but the game neither draws their LOD-selected meshes nor lets the player grab their climb edges. Falls
-    back to top_block when the map has no such cell."""
+    where retail activates every building, and where new collision goes. Elements in the whole-map cell (top_block)
+    load, but the game neither draws their LOD-selected meshes nor lets the player grab their climb edges (editor
+    visuals, direct meshes, go there all the same: scenery_block). Falls back to top_block when the map has no such
+    cell."""
     import math
     g = grid_layout(doc)
     if g is not None:
@@ -1214,7 +1215,8 @@ MAX_ENTRIES = 4990   # anvilforge writes up to 5000 entries per FileSet; more ne
 def store_mesh(doc: MapDocument, root: Root, name: str, user_fn: str) -> int:
     """Store a Mesh root the retail way: alone in its own entry, listed (kind 1) in the dependency table of the
     entry user_fn whose Visual shows it. ACB does not draw editor meshes kept as roots inside a streamed grid-cell
-    entry (collision in the same entry works); retail stores nearly every mesh so. Returns the mesh uid."""
+    entry (collision in the same entry works); retail stores nearly every mesh so. Not enough on its own: user_fn
+    must also be the whole-map cell's (scenery_block). Returns the mesh uid."""
     if len(doc.fnames) >= MAX_ENTRIES:
         raise EditError(f"the forge already has {len(doc.fnames)} entries (limit {MAX_ENTRIES}): merge pieces")
     fn = doc.add_entry(name, [(root, name)])
@@ -1335,12 +1337,20 @@ def set_visual(doc: MapDocument, key, mesh_input) -> int:
     return mesh_uid
 
 
+def scenery_block(doc: MapDocument) -> int:
+    """Where editor visuals go: the whole-map cell (top_block). In game (Forbidden City over Alhambra, 2026-11-15)
+    no editor mesh shown by an element of a streamed level-0 cell ever drew, own entry and dependency or not, while
+    copies of the same pieces in the whole-map cell did. Retail shows direct meshes (MeshInstanceData) only from
+    that cell, or with the mesh listed by a level-1 cell (benches); its level-0 buildings all use LODSelectors."""
+    return top_block(doc)
+
+
 def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None,
                 block: int | None = None) -> tuple[int, int]:
-    """A new visual-only element (no collision, no climb edges) showing mesh_input, in `block` (default: the
-    level-0 grid cell under its origin, cell_block). Returns its key."""
+    """A new visual-only element (no collision, no climb edges) showing mesh_input, in `block` (default:
+    scenery_block, where the game draws it). Returns its key."""
     t = template_key or collision_template(doc).key
-    key = duplicate(doc, t, matrix, block if block is not None else _block_at(doc, matrix))
+    key = duplicate(doc, t, matrix, block if block is not None else scenery_block(doc))
     o = element_obj(doc, key)
     o.fields["Components"] = [p for p in o.fields["Components"]
                               if not (isinstance(p, Ptr) and p.obj is not None
@@ -1348,3 +1358,75 @@ def new_scenery(doc: MapDocument, matrix: bytes, mesh_input, template_key=None,
     set_visual(doc, key, mesh_input)
     fit_new_element(o)
     return key
+
+
+def _visuals(o: Obj) -> list[Obj]:
+    return [p.obj for p in o.fields.get("Components", [])
+            if isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) == "Visual"]
+
+
+def _strip_visuals(o: Obj) -> None:
+    o.fields["Components"] = [p for p in o.fields["Components"] if not (
+        isinstance(p, Ptr) and p.obj is not None and type_name(p.obj.type_hash) == "Visual")]
+
+
+def _plain(o: Obj) -> bool:
+    """Only the components editor-made static elements have (no game logic a visual twin would duplicate)."""
+    return type_name(o.type_hash) == "Entity" and all(
+        type_name(p.obj.type_hash) in ("Visual", "InertComponent", "GuidanceSystem")
+        for p in o.fields.get("Components", []) if isinstance(p, Ptr) and p.obj is not None)
+
+
+def drawn_visual(doc: MapDocument, key, mesh_input) -> tuple[int, int]:
+    """set_visual where the game draws it: a plain root element of a streamed cell (collision, climb edges) stays
+    where it is without visuals, and a visual-only twin at its matrix in scenery_block shows the mesh; anything else
+    gets the mesh itself. Returns the key of the element showing it."""
+    o = element_obj(doc, key)
+    top = scenery_block(doc)
+    if key[1] >= 0 or owning_block(doc, key[0]) == top or not _plain(o):
+        set_visual(doc, key, mesh_input)
+        return key
+    _strip_visuals(o)
+    doc.touch(key[0])
+    return new_scenery(doc, o.fields["GlobalMatrix"], mesh_input, block=top)
+
+
+def _mesh_shown(doc: MapDocument, o: Obj) -> int | None:
+    """The Mesh a Visual of `o` shows directly (MeshInstanceData), or None."""
+    for v in _visuals(o):
+        idata = getattr(v.fields.get("InstanceData"), "obj", None)
+        r = v.fields.get("Object")
+        if (idata is not None and type_name(idata.type_hash) == "MeshInstanceData" and isinstance(r, Ref)
+                and u32(r.id) in doc.info and doc.type_of(u32(r.id)) == "Mesh"):
+            return u32(r.id)
+    return None
+
+
+def rehome_editor_visuals(doc: MapDocument) -> int:
+    """Migrate forges whose editor elements show their mesh from a streamed grid cell (invisible in game, see
+    scenery_block): each gets a visual-only twin in scenery_block; a visual-only original goes, one with collision
+    stays where it is without its visuals. Returns the number of twins made."""
+    from . import visual as V
+    top = scenery_block(doc)
+    todo = [u for u in doc.uids("Entity") if is_editor_id(u) and doc.root(u) is not None and _plain(doc.obj(u))
+            and _mesh_shown(doc, doc.obj(u)) is not None and owning_block(doc, u) not in (None, top)]
+    gone = []
+    for u in todo:
+        o = doc.obj(u)
+        nk = duplicate(doc, (u, -1), block=top)
+        t = element_obj(doc, nk)
+        t.fields["Components"] = [p for p in t.fields["Components"]
+                                  if not (isinstance(p, Ptr) and p.obj is not None
+                                          and type_name(p.obj.type_hash) in ("InertComponent", "GuidanceSystem"))]
+        g = V.mesh_geometry(doc, _mesh_shown(doc, t))
+        fit_new_element(t, list(g.verts) if g is not None else None)
+        if inert_components(o):
+            _strip_visuals(o)
+            doc.touch(u)
+        else:
+            gone.append((u, -1))
+    for k, why in delete_many(doc, gone).items():
+        if why is not None:   # something links to it: it stays, shown by its twin
+            _strip_visuals(doc.obj(k[0]))
+            doc.touch(k[0])
+    return len(todo)

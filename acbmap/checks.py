@@ -147,9 +147,23 @@ def check_compounds(doc: MapDocument) -> list[str]:
     return out
 
 
+def check_editor_visuals(doc: MapDocument) -> list[str]:
+    """Editor meshes shown from a streamed grid cell never draw in game (ops.scenery_block). Gameplay copies (benches
+    and the like) keep their retail layout and aren't checked."""
+    from .ops import _mesh_shown, _plain, owning_block, scenery_block
+    try:
+        top = scenery_block(doc)
+    except Exception:
+        return []
+    return [f"visuals: {doc.name_of(u)} shows its mesh from {doc.name_of(b)}, not the whole-map cell (invisible "
+            f"in game; ops.drawn_visual / rehome_editor_visuals)"
+            for u in doc.uids("Entity") if is_editor_id(u) and doc.root(u) is not None and _plain(doc.obj(u))
+            and _mesh_shown(doc, doc.obj(u)) is not None and (b := owning_block(doc, u)) not in (None, top)]
+
+
 def run_all(doc: MapDocument) -> list[str]:
     return (check_alignment(doc.path) + check_blocks(doc) + check_spawns(doc) + check_deps(doc)
-            + check_editor_ids(doc) + check_mesh_shapes(doc) + check_compounds(doc))
+            + check_editor_ids(doc) + check_mesh_shapes(doc) + check_compounds(doc) + check_editor_visuals(doc))
 
 
 def summary(problems: list[str]) -> Counter:

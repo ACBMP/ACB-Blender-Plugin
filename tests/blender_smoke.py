@@ -91,6 +91,7 @@ cube.data.materials.append(acb_mat)
 cube_name = cube.name
 res_col = bpy.ops.acb.new_collision()
 vis_col = bpy.context.scene.objects.get(cube_name + "_col")
+vis_twin = bpy.context.scene.objects.get(cube_name + "_vis")   # its visual: a twin in the whole-map cell
 cube2 = plain(bpy.ops.mesh.primitive_cube_add, base + Vector((4, 0, 8)), size=1)
 cube2_name = cube2.name
 res_scn = bpy.ops.acb.new_scenery()
@@ -108,7 +109,7 @@ res_big = bpy.ops.acb.new_collision(climb=False)
 pieces = [o for o in bpy.context.scene.objects
           if o.name.startswith(grid_name + "_col") and "acb_key" in o and not o.get("acb_part")]
 print("SMOKE big import", res_big, len(pieces), "pieces")
-col_key, scn_key = vis_col["acb_key"], scn["acb_key"]
+col_key, twin_key, scn_key = vis_col["acb_key"], vis_twin["acb_key"], scn["acb_key"]
 climb_drawn = bpy.data.objects.get(f"{climb_el.name}:climb")
 print("SMOKE generate_climb", res, "drawn", climb_drawn is not None)
 print("SMOKE log", log)
@@ -145,7 +146,10 @@ n_climb = sum(len(G.edges(g)) for g in ce)
 check(res == {"FINISHED"} and (n_climb == 0 or (climb_drawn is not None and len(climb_drawn.data.edges) == n_climb)),
       f"generated climb edges saved and drawn ({n_climb})")
 from acbmap import visual as Vis
-gc = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(col_key)))[0])
+gc = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(twin_key)))[0])
+check(not Vis.entity_meshes(d, O.element_obj(d, S.parse_key(col_key)))
+      and all(O.owning_block(d, S.parse_key(k)[0]) == O.scenery_block(d) for k in (twin_key, scn_key)),
+      "visible collision: collision in its cell, mesh on a twin; scenery in the whole-map cell")
 gs = Vis.mesh_geometry(d, Vis.entity_meshes(d, O.element_obj(d, S.parse_key(scn_key)))[0])
 check(res_col == res_scn == res_rep == {"FINISHED"}, "mesh to collision / scenery / replace visual ran")
 chosen = int(acb_mat["acb_vis_material"], 16)

@@ -253,6 +253,7 @@ class Session:
         from acbmap.visual import fix_mesh_categories
         self.migrated += fix_mesh_categories(self.doc)   # meshes an earlier version cloned from a pickup: invisible
         self.migrated += ops.split_editor_meshes(self.doc)   # meshes an earlier version kept in grid cells: invisible
+        self.migrated += ops.rehome_editor_visuals(self.doc)   # meshes shown from streamed cells: invisible too
         self.source = forge_path
         self.multi_dir = multi_dir or os.path.dirname(forge_path)
         self.wd = WorldData(self.doc, self.multi_dir)
@@ -594,7 +595,8 @@ class Session:
     def import_mesh(self, ob, collision=True, visible=True, max_size=SP.MAX_SIZE, surface="auto"):
         """Turn a plain mesh object into new elements, split into game-sized pieces (acbmap.split), each centred on
         its own origin and placed in the grid cell under that origin (ops.cell_block). collision: static collision (MeshShape), visible: a
-        visual mesh. surface: ground / roof / wall for the collision (auto: the object's custom property acb_surface,
+        visual mesh, on a visual-only element in the whole-map cell (ops.scenery_block: the game draws it only there),
+        so a piece with both makes two elements. surface: ground / roof / wall for the collision (auto: the object's custom property acb_surface,
         else ops.surface_of the whole mesh, so all pieces of one object agree). Returns the new element keys (climb
         edges are left to the caller, who can then build the world collision once for all of them)."""
         loc, rot, sc = ob.matrix_world.decompose()
@@ -621,8 +623,8 @@ class Session:
                 if len(v) > 0xFFFF:
                     raise ValueError(f"{ob.name}: a piece has {len(v)} collision vertices (at most 65535)")
                 nk = ops.new_collision(self.doc, m, v, t, mm, surface=surface)
-                if vis:
-                    ops.set_visual(self.doc, nk, SP.sub_mesh_input(mi, vis, c))
+                if vis:   # drawn by a visual-only twin in the whole-map cell (ops.scenery_block)
+                    keys.append(ops.new_scenery(self.doc, m, SP.sub_mesh_input(mi, vis, c)))
             elif vis:
                 nk = ops.new_scenery(self.doc, m, SP.sub_mesh_input(mi, vis, c))
             else:
