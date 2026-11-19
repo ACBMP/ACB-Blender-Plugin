@@ -38,6 +38,15 @@ from .navmesh import REL, inside2d, z_on
 KEY = 1e-3          # positions closer than this (m) are the same vertex
 MIN_AREA = 1e-4     # m^2: smaller triangles are dropped
 SEAM_TOL = 0.02     # m: how far off another edge's line an edge may lie and still seam to it
+# Tidier navmesh layouts per cell (assign, after grouping): no navmesh's bounding box inside another's
+# (_split_nested), and no more than CROWD_MAX boxes sharing a point (_uncrowd: edge-sharing navmeshes merge).
+# Written while chasing the Forbidden City load crash (ACBMP.exe 0x01a3a203, Havok's MOPP splitter finding no split);
+# both patterns correlated with it but were NOT the cause: that was a single 2 cm navmesh (a scrap of a cut old
+# triangle, 0.0001 m2). Kept because the builds that load in game were made with them on.
+SPLIT_NESTED = True
+NEST_TOL = 1e-3
+CROWD_MAX = 3
+CROWD_TOL = 1e-3
 SEAM_DZ = 0.3       # m: height difference along a seam
 CORNER_TURN = 0.2   # radians: boundary turns sharper than this get a corner waypoint
 CORNER_OFFSET = 0.35
@@ -379,6 +388,9 @@ class _Edit:
                                 own[j] = ms
                                 nxt.append(j)
                     todo = nxt
+            if SPLIT_NESTED:
+                self._split_nested(mgr, plist, own, nbrs)
+                self._uncrowd(mgr, plist, own, nbrs)
             for (T, _o), ms in zip(plist, own):
                 new.setdefault(ms, []).append(T)
         changed = {}
@@ -392,6 +404,149 @@ class _Edit:
             if old != cur:
                 changed[ms] = got
         return changed
+
+    def _split_nested(self, mgr, plist, own, nbrs, max_rounds=400):
+        """Split the cell's new grouping (own[i] = navmesh of piece i) until no navmesh's box lies inside (or equals)
+        another's: the outer one is cut along a line through or at the edge of the inner one, each side then into its
+        connected parts (seams join them again). Triangles with the same plan box (the two halves of a rectangle)
+        stay on one side, so a cut never leaves two navmeshes with one box."""
+        def box(pts):
+            P = [p for T in pts for p in T]
+            return ([min(p[k] for p in P) for k in range(3)], [max(p[k] for p in P) for k in range(3)])
+
+        def inside(a, b):   # a's box within b's
+            return all(b[0][k] - NEST_TOL <= a[0][k] and a[1][k] <= b[1][k] + NEST_TOL for k in range(3))
+
+        unit = {}           # piece -> key of its plan box: rectangle halves share one
+        for i, (T, _o) in enumerate(plist):
+            unit[i] = tuple(round(v, 3) for v in (min(p[0] for p in T), min(p[1] for p in T),
+                                                  max(p[0] for p in T), max(p[1] for p in T)))
+        mine = {id(ms) for ms in own}
+        fixed = [box([t.corners() for t in ms.tris]) for ms in mgr.meshes if id(ms) not in mine and ms.tris]
+        stuck = set()
+        for _round in range(max_rounds):
+            groups = defaultdict(list)
+            for i, ms in enumerate(own):
+                groups[id(ms)].append(i)
+            boxes = {g: box([plist[i][0] for i in idx]) for g, idx in groups.items()}
+            hit = None
+            for ga, ba in boxes.items():
+                if ga in stuck:
+                    continue
+                for other in [b for g, b in boxes.items() if g != ga] + fixed:
+                    if inside(other, ba):
+                        hit = (ga, other)
+                        break
+                if hit:
+                    break
+            if hit is None:
+                return
+            ga, inner = hit
+            idx = groups[ga]
+            ucent = defaultdict(list)
+            for i in idx:
+                ucent[unit[i]].append(i)
+            best = None
+            for ax in (0, 1):
+                for c in (inner[0][ax], inner[1][ax], (inner[0][ax] + inner[1][ax]) / 2):
+                    side = {}
+                    for key, members in ucent.items():
+                        s_ = (key[ax] + key[ax + 2]) / 2 >= c
+                        for i in members:
+                            side[i] = s_
+                    n1 = sum(side.values())
+                    if 0 < n1 < len(idx):
+                        bal = min(n1, len(idx) - n1)
+                        if best is None or bal > best[0]:
+                            best = (bal, side)
+            if best is None:
+                stuck.add(ga)
+                self.stats["nested_left"] += 1
+                continue
+            side = best[1]
+            keep = own[idx[0]]
+            seen = set()
+            first = True
+            for i in idx:
+                if i in seen:
+                    continue
+                comp, todo = [], [i]
+                seen.add(i)
+                while todo:
+                    a = todo.pop()
+                    comp.append(a)
+                    for j in list(nbrs[a]) + ucent[unit[a]]:
+                        if j not in seen and j in side and side[j] == side[i]:
+                            seen.add(j)
+                            todo.append(j)
+                ms = keep if first else self._new_mesh(mgr)
+                first = False
+                for a in comp:
+                    own[a] = ms
+            self.stats["nested_splits"] += 1
+        self.stats["nested_left"] += 1
+
+    def _uncrowd(self, mgr, plist, own, nbrs, max_rounds=400):
+        """Merge navmeshes of the cell's new grouping (own) until no CROWD_MAX + 1 navmesh boxes (new or untouched)
+        share a point. Boxes overlapping pairwise share a point (axis-aligned boxes), so a crowd is a clique of the
+        overlap graph. Of a crowd, the two new navmeshes that share an edge and whose merged box is smallest merge."""
+        from itertools import combinations
+
+        def box(pts):
+            P = [p for T in pts for p in T]
+            return ([min(p[k] for p in P) for k in range(3)], [max(p[k] for p in P) for k in range(3)])
+
+        def meet(a, b):
+            return all(a[0][k] <= b[1][k] + CROWD_TOL and b[0][k] <= a[1][k] + CROWD_TOL for k in range(3))
+
+        mine = {id(ms) for ms in own}
+        fixed = [box([t.corners() for t in ms.tris]) for ms in mgr.meshes if id(ms) not in mine and ms.tris]
+        stuck = set()
+        for _round in range(max_rounds):
+            groups = defaultdict(list)
+            for i, ms in enumerate(own):
+                groups[id(ms)].append(i)
+            gid = list(groups)
+            boxes = [box([plist[i][0] for i in groups[g]]) for g in gid] + fixed
+            n = len(boxes)
+            adj = [set() for _ in range(n)]
+            for i, j in combinations(range(n), 2):
+                if meet(boxes[i], boxes[j]):
+                    adj[i].add(j)
+                    adj[j].add(i)
+            crowd = None
+            for i in range(n):          # a clique of CROWD_MAX + 1 with at least one changeable pair
+                for c in combinations(sorted(j for j in adj[i] if j > i), CROWD_MAX):
+                    if all(b in adj[a] for a, b in combinations(c, 2)):
+                        cl = (i,) + c
+                        if frozenset(cl) not in stuck:
+                            crowd = cl
+                            break
+                if crowd:
+                    break
+            if crowd is None:
+                return
+            group_of = {i: gid[k] for k in range(len(gid)) for i in groups[gid[k]]}
+            best = None
+            for a, b in combinations([k for k in crowd if k < len(gid)], 2):
+                ga, gb = gid[a], gid[b]
+                if not any(group_of.get(j) == gb for i in groups[ga] for j in nbrs[i]):
+                    continue
+                lo = [min(boxes[a][0][k], boxes[b][0][k]) for k in range(2)]
+                hi = [max(boxes[a][1][k], boxes[b][1][k]) for k in range(2)]
+                area = (hi[0] - lo[0]) * (hi[1] - lo[1])
+                if best is None or area < best[0]:
+                    best = (area, ga, gb)
+            if best is None:
+                stuck.add(frozenset(crowd))
+                self.stats["crowds_left"] += 1
+                continue
+            _a, ga, gb = best
+            keep = own[groups[ga][0]]
+            for i in groups[gb]:
+                own[i] = keep
+            self.stats["crowd_merges"] += 1
+        self.stats["crowds_left"] += 1
 
     def _new_mesh(self, mgr):
         src = mgr.meshes[0].obj if mgr.meshes else next(self.model.meshes()).obj
